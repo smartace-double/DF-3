@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 # ===========================
 # Load your dataset here
 # ===========================
-df = pd.read_csv("btc_5m_complete_dataset.csv", parse_dates=['timestamp'], index_col='timestamp')
+df = pd.read_csv("datasets/structured_dataset.csv", parse_dates=['timestamp'], index_col='timestamp')
 
 # ===========================
 # Target Engineering
