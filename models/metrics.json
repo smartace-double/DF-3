@@ -1,0 +1,32 @@
+[
+  {
+    "fold": 1,
+    "point_mape": 0.004418285355187964,
+    "interval_width_mean": 0.00024386180267723385,
+    "inclusion_rate": 0.012345679012345678
+  },
+  {
+    "fold": 2,
+    "point_mape": 0.0025917670637166388,
+    "interval_width_mean": 0.00023765263797411566,
+    "inclusion_rate": 0.04938271604938271
+  },
+  {
+    "fold": 3,
+    "point_mape": 0.0028439344776912227,
+    "interval_width_mean": 0.0002566679020959108,
+    "inclusion_rate": 0.030864197530864196
+  },
+  {
+    "fold": 4,
+    "point_mape": 0.0035663565400255843,
+    "interval_width_mean": 0.0002347586920769706,
+    "inclusion_rate": 0.018518518518518517
+  },
+  {
+    "fold": 5,
+    "point_mape": 0.002602213366648391,
+    "interval_width_mean": 0.00026972295786070375,
+    "inclusion_rate": 0.04938271604938271
+  }
+]
