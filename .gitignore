@@ -1,2 +1,3 @@
 *.csv
 /prec-venv
+/precog/

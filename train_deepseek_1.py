@@ -118,8 +118,8 @@ class BTCDataset:
         self.horizon = horizon
         self.scaler = StandardScaler()
         self.target_cols = ['close', 'low', 'high']
-        # self.feature_cols = []  # all features are used
-        # self.X, self.y = self.load_dataset()
+        self.feature_cols = []  # Will be set during preprocessing
+        self.scaler_fitted = False
 
     def load_dataset(self):
         df = pd.read_csv(self.dataset_path, parse_dates=['timestamp'])
@@ -166,7 +166,7 @@ class BTCDataset:
         
         # bias = 15000
 
-        for i in range(self.lookback, 1000):
+        for i in range(self.lookback, max_i):
             # Features (lookback window)
             X.append(df[:].iloc[i-self.lookback:i].values)
             
@@ -189,24 +189,23 @@ class BTCDataset:
             elif pd.api.types.is_numeric_dtype(df[col]):
                 df[col] = df[col].fillna(df[col].mean())
         
-        # 2. Remove extreme outliers (99.9th percentile)
+        # 2. Remove extreme outliers (99.9th percentile) - but NOT for targets
         numeric_cols = df.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
+        feature_cols = [col for col in numeric_cols if col not in self.target_cols]
+        
+        for col in feature_cols:  # Only clip features, not targets
             upper = df[col].quantile(0.999)
             lower = df[col].quantile(0.001)
             df[col] = np.clip(df[col], lower, upper)
 
         # Check for missing features
-        missing_features = [col for col in numeric_cols if df[col].isna().any()]
+        missing_features = [col for col in feature_cols if df[col].isna().any()]
         if missing_features:
             print(f"Warning: Missing features: {missing_features}")
             df[missing_features] = df[missing_features].fillna(method='bfill').fillna(method='ffill')
         
-        # 3. Normalization - apply scaler only to numeric features that are not time-based
-        non_temporal_cols = [col for col in numeric_cols 
-                           if not col.endswith(('_sin', '_cos'))]
-        if len(non_temporal_cols) > 0:
-            df[non_temporal_cols] = self.scaler.fit_transform(df[non_temporal_cols])
+        # 3. CRITICAL FIX: Don't scale here - scaling will be done during training
+        # to avoid data leakage. We'll scale only the training portion.
         
         # Handle infinite values
         df = df.replace([np.inf, -np.inf], np.nan)
@@ -216,6 +215,28 @@ class BTCDataset:
             raise ValueError("NaNs still present after cleaning")
             
         return df
+
+    def fit_scaler(self, X_train):
+        """Fit scaler only on training data to avoid data leakage"""
+        if not self.scaler_fitted:
+            # Reshape X_train to 2D for scaling
+            X_2d = X_train.reshape(-1, X_train.shape[-1])
+            self.scaler.fit(X_2d)
+            self.scaler_fitted = True
+            # print("Scaler fitted on training data only")
+    
+    def transform_data(self, X):
+        """Transform data using fitted scaler"""
+        if not self.scaler_fitted:
+            raise ValueError("Scaler must be fitted before transforming")
+        
+        # Reshape to 2D, scale, then reshape back
+        original_shape = X.shape
+        X_2d = X.reshape(-1, X.shape[-1])
+        X_scaled_2d = self.scaler.transform(X_2d)
+        X_scaled = X_scaled_2d.reshape(original_shape)
+        
+        return X_scaled
 
     # def create_targets(self, df):
     #     """Create future price targets"""
@@ -395,43 +416,40 @@ class EnhancedBitcoinPredictor(nn.Module):
 
 def challenge_loss(point_pred, interval_pred, targets):
     """
-    Competition-optimized loss function that mirrors the scoring system:
-    1. Point prediction: Absolute percentage error (MAPE)
-    2. Interval prediction: Balanced width and inclusion factors
+    Loss function matching the challenge scoring:
+    50% point prediction (MAPE), 50% interval (width + inclusion penalty)
     """
-    # Extract targets (actual price, low_1h, high_1h)
-    price_target = targets[:, 0].clamp(min=1e-4)  # Avoid division by zero
+    # Extract targets
+    price_target = targets[:, 0].clamp(min=1e-4)
     low_target = targets[:, 1]
     high_target = targets[:, 2]
-    
-    # ===== 1. Point Prediction Loss =====
-    # Mean Absolute Percentage Error (matches competition metric)
-    point_error = torch.abs(point_pred - price_target) / price_target
-    point_loss = point_error.mean()
-    
-    # ===== 2. Interval Prediction Loss =====
+
+    # 1. Point Prediction Loss (MAPE)
+    point_loss = (torch.abs(point_pred - price_target) / price_target).mean()
+
+    # 2. Interval Loss
     interval_min = interval_pred[:, 0]
     interval_max = interval_pred[:, 1]
-    
-    # Ensure valid intervals (min <= max)
+    # Ensure valid intervals
     interval_min = torch.minimum(interval_min, interval_max - 1e-4)
-    
-    # Width Factor (normalized by price)
-    width_ratio = (interval_max - interval_min) / price_target
-    
-    # Inclusion Reward (continuous approximation)
-    lower_miss = F.relu(low_target - interval_min)  # How much below min
-    upper_miss = F.relu(interval_max - high_target)  # How much above max
-    inclusion_reward = torch.exp(-(lower_miss + upper_miss))
-    
-    # ===== 3. Combined Loss =====
-    # Mirror competition weights (50/50 split)
-    total_loss = 0.5 * point_loss + 0.5 * (width_ratio.mean() + (1 - inclusion_reward.mean()))
-    
+    interval_max = torch.maximum(interval_max, interval_min + 1e-4)
+
+    # Width penalty (normalized)
+    width_loss = ((interval_max - interval_min) / price_target).mean()
+
+    # Inclusion penalty: penalize if [low, high] not inside [min, max]
+    lower_miss = F.relu(low_target - interval_min)
+    upper_miss = F.relu(interval_max - high_target)
+    inclusion_penalty = (lower_miss + upper_miss).mean() / price_target.mean()
+
+    interval_loss = width_loss + inclusion_penalty
+
+    # Combine with 50/50 weights
+    total_loss = 0.5 * point_loss + 0.5 * interval_loss
     return total_loss
 
 
-def train_with_cv(X, y, params, save_dir='models', trial_name=None):
+def train_with_cv(X, y, params, dataset=None, save_dir='models', trial_name=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(save_dir, exist_ok=True)
     
@@ -439,10 +457,10 @@ def train_with_cv(X, y, params, save_dir='models', trial_name=None):
     tscv = TimeSeriesSplit(n_splits=5)
     fold_scores = []
     
-    print(f"\n{'='*60}")
-    print(f"TRIAL: {trial_name}")
-    print(f"Parameters: {params}")
-    print(f"{'='*60}")
+    # print(f"\n{'='*60}")
+    # print(f"TRIAL: {trial_name}")
+    # print(f"Parameters: {params}")
+    # print(f"{'='*60}")
     
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
         # print(f"\n--- Training fold {fold + 1}/5 ---")
@@ -452,10 +470,21 @@ def train_with_cv(X, y, params, save_dir='models', trial_name=None):
         X_train, X_val = X[train_idx], X[val_idx]
         y_train, y_val = y[train_idx], y[val_idx]
         
+        # CRITICAL: Fit scaler only on training data to avoid data leakage
+        if dataset is not None:
+            dataset.fit_scaler(X_train)
+            # Scale the data properly
+            X_train_scaled = dataset.transform_data(X_train)
+            X_val_scaled = dataset.transform_data(X_val)
+        else:
+            # Fallback: no scaling (for backward compatibility)
+            X_train_scaled = X_train
+            X_val_scaled = X_val
+        
         # Convert to tensors
-        X_train = torch.FloatTensor(X_train)
+        X_train = torch.FloatTensor(X_train_scaled)
         y_train = torch.FloatTensor(y_train)
-        X_val = torch.FloatTensor(X_val)
+        X_val = torch.FloatTensor(X_val_scaled)
         y_val = torch.FloatTensor(y_val)
         
         # Create datasets
@@ -585,6 +614,9 @@ def train_with_cv(X, y, params, save_dir='models', trial_name=None):
 def evaluate(model, data_loader, device):
     model.eval()
     total_loss = 0
+    all_point_preds = []
+    all_interval_preds = []
+    all_targets = []
     
     with torch.no_grad():
         for batch_X, batch_y in data_loader:
@@ -596,6 +628,44 @@ def evaluate(model, data_loader, device):
             # Challenge-specific loss
             loss = challenge_loss(point_pred, interval_pred, batch_y)
             total_loss += loss.item()
+            
+            # Collect predictions for detailed analysis
+            all_point_preds.append(point_pred.cpu())
+            all_interval_preds.append(interval_pred.cpu())
+            all_targets.append(batch_y.cpu())
+    
+    # Concatenate all predictions
+    all_point_preds = torch.cat(all_point_preds, dim=0)
+    all_interval_preds = torch.cat(all_interval_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+    
+    # Calculate detailed metrics
+    price_target = all_targets[:, 0]
+    low_target = all_targets[:, 1]
+    high_target = all_targets[:, 2]
+    
+    # Point prediction metrics
+    mape = torch.abs(all_point_preds - price_target) / price_target.clamp(min=1e-4)
+    mape_score = mape.mean().item()
+    
+    # Interval metrics
+    interval_min = all_interval_preds[:, 0]
+    interval_max = all_interval_preds[:, 1]
+    
+    # Width metrics
+    width_ratio = (interval_max - interval_min) / price_target.clamp(min=1e-4)
+    avg_width = width_ratio.mean().item()
+    
+    # Inclusion metrics
+    lower_miss = torch.relu(low_target - interval_min)
+    upper_miss = torch.relu(interval_max - high_target)
+    inclusion_rate = ((lower_miss == 0) & (upper_miss == 0)).float().mean().item()
+    
+    # Invalid interval rate
+    invalid_intervals = (interval_min >= interval_max).float().mean().item()
+    
+    # Print detailed metrics (optional, can be commented out for speed)
+    print(f"  MAPE: {mape_score:.4f}, Width: {avg_width:.4f}, Inclusion: {inclusion_rate:.4f}, Invalid: {invalid_intervals:.4f}")
     
     return total_loss / len(data_loader)
 
@@ -721,7 +791,7 @@ def objective(trial, X, y) -> float:
         print(f"{'*'*80}")
         
         # Train with CV
-        cv_score = train_with_cv(X, y, params, trial_name=trial_name)
+        cv_score = train_with_cv(X, y, params, dataset=dataset, trial_name=trial_name)
         
         print(f"{trial_name} completed successfully with score: {cv_score:.4f}")
         return float(cv_score)
@@ -779,5 +849,5 @@ if __name__ == "__main__":
     # Use the same epochs as optimization to maintain consistency
     print(f"Final training epochs: {final_params['epochs']} (same as optimization, with early stopping)")
     
-    final_score = train_with_cv(X, y, final_params, trial_name="FINAL_MODEL")
+    final_score = train_with_cv(X, y, final_params, dataset=dataset, trial_name="FINAL_MODEL")
     print(f"Final CV Score: {final_score}")

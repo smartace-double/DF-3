@@ -1,12 +1,12 @@
 {
   "hidden_size": 512,
-  "num_layers": 1,
-  "lr": 0.0002130711435425683,
+  "num_layers": 2,
+  "lr": 5.317372201011151e-05,
   "batch_size": 16,
-  "weight_decay": 0.0005087321147292864,
-  "dropout": 0.15000000000000002,
-  "epochs": 5,
-  "grad_clip": 0.8328801650722566,
-  "use_layer_norm": true,
-  "activation": "SiLU"
+  "weight_decay": 3.685044474538892e-07,
+  "dropout": 0.2,
+  "epochs": 2,
+  "grad_clip": 0.8340656950120786,
+  "use_layer_norm": false,
+  "activation": "GELU"
 }
