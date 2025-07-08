@@ -30,7 +30,7 @@ def load_data(file_path):
         df.set_index('timestamp', inplace=True)
         df.sort_index(inplace=True)
         logger.info(f"Data loaded successfully. Shape: {df.shape}")
-        return df
+        return df[:1000]
     except Exception as e:
         logger.error(f"Error loading data: {e}")
         raise
@@ -224,19 +224,19 @@ def prepare_training_data(df):
         close_prices = close_prices[mask]  # Apply same mask
         
         # Remove low variance features
-        selector = VarianceThreshold(threshold=1e-5)
-        X_selected = selector.fit_transform(X)
-        selected_features = X.columns[selector.get_support()].tolist()
-        X = X[selected_features]
+        # selector = VarianceThreshold(threshold=1e-5)
+        # X_selected = selector.fit_transform(X)
+        # selected_features = X.columns[selector.get_support()].tolist()
+        # X = X[selected_features]
         
         # Remove highly correlated features
-        corr_matrix = X.corr().abs()
-        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-        to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
-        X = X.drop(columns=to_drop)
+        # corr_matrix = X.corr().abs()
+        # upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        # to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+        # X = X.drop(columns=to_drop)
         
-        logger.info(f"Removed {len(to_drop)} highly correlated features")
-        logger.info(f"Final feature count: {X.shape[1]}")
+        # logger.info(f"Removed {len(to_drop)} highly correlated features")
+        # logger.info(f"Final feature count: {X.shape[1]}")
         
         # Add close prices back to X for evaluation (but not as a feature)
         X['close'] = close_prices

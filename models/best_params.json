@@ -1,0 +1,12 @@
+{
+  "hidden_size": 512,
+  "num_layers": 1,
+  "lr": 0.0002130711435425683,
+  "batch_size": 16,
+  "weight_decay": 0.0005087321147292864,
+  "dropout": 0.15000000000000002,
+  "epochs": 5,
+  "grad_clip": 0.8328801650722566,
+  "use_layer_norm": true,
+  "activation": "SiLU"
+}

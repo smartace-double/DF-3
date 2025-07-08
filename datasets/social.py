@@ -68,6 +68,7 @@ REDDIT_LIMIT = 100  # Max posts per request
 
 # Telegram public channels (web scraping)
 TELEGRAM_CHANNELS = [
+    'whalebotalerts',  # Whale alert bot
     'bitcoinnewschannel', 'cryptosignalsorg', 'cryptopanic', 
     'cryptonewsvideo', 'whale_alert', 'cryptodaily'
 ]
@@ -235,18 +236,39 @@ def collect_news_data() -> List[Dict[str, Any]]:
                     try:
                         # Parse publication date
                         pub_date = entry.get('published_parsed', entry.get('updated_parsed'))
-                        if pub_date:
-                            timestamp = datetime(*pub_date[:6], tzinfo=UTC_TZ)
+                        if pub_date and hasattr(pub_date, '__getitem__'):
+                            # Ensure we have a proper time tuple
+                            if len(pub_date) >= 6:
+                                # Convert to proper integers for datetime constructor
+                                year, month, day, hour, minute, second = int(pub_date[0]), int(pub_date[1]), int(pub_date[2]), int(pub_date[3]), int(pub_date[4]), int(pub_date[5])
+                                timestamp = datetime(year, month, day, hour, minute, second, tzinfo=UTC_TZ)
+                            else:
+                                timestamp = datetime.now(UTC_TZ)
                         else:
                             timestamp = datetime.now(UTC_TZ)
                         
-                        # Skip if outside date range
-                        if not (START_DATE <= timestamp <= END_DATE):
+                        # Accept all recent data (within last 7 days)
+                        if timestamp < START_DATE:
                             continue
                         
-                        title = clean_text_content(entry.get('title', ''))
-                        summary = clean_text_content(entry.get('summary', ''))
-                        content = clean_text_content(entry.get('content', [{}])[0].get('value', ''))
+                        # Safely extract and clean text content
+                        title = str(entry.get('title', ''))
+                        summary = str(entry.get('summary', ''))
+                        
+                        # Handle content field which can be a list or dict
+                        content = ''
+                        content_field = entry.get('content', [])
+                        if isinstance(content_field, list) and len(content_field) > 0:
+                            content = str(content_field[0].get('value', ''))
+                        elif isinstance(content_field, dict):
+                            content = str(content_field.get('value', ''))
+                        else:
+                            content = str(content_field)
+                        
+                        # Clean all text fields
+                        title = clean_text_content(title)
+                        summary = clean_text_content(summary)
+                        content = clean_text_content(content)
                         
                         # Combine content sources
                         full_text = f"{title} {summary} {content}"
@@ -267,7 +289,7 @@ def collect_news_data() -> List[Dict[str, Any]]:
                             'platform': 'news',
                             'title': title,
                             'content': full_text[:2000],  # Truncate long content
-                            'url': entry.get('link', ''),
+                            'url': str(entry.get('link', '')),
                             'content_hash': content_hash,
                             **price_context
                         }
@@ -305,8 +327,8 @@ def collect_reddit_data() -> List[Dict[str, Any]]:
                         created_utc = post_data.get('created_utc', time.time())
                         timestamp = datetime.fromtimestamp(created_utc, tz=UTC_TZ)
                         
-                        # Skip if outside date range
-                        if not (START_DATE <= timestamp <= END_DATE):
+                        # Accept all recent data (within last 7 days)
+                        if timestamp < START_DATE:
                             continue
                         
                         title = clean_text_content(post_data.get('title', ''))
@@ -369,11 +391,14 @@ def collect_telegram_data() -> List[Dict[str, Any]]:
                         if not time_element:
                             continue
                             
-                        timestamp_str = time_element['datetime']
+                        timestamp_str = str(time_element.get('datetime', ''))
+                        if not timestamp_str:
+                            continue
+                            
                         timestamp = datetime.fromisoformat(timestamp_str).astimezone(UTC_TZ)
                         
-                        # Skip if outside date range
-                        if not (START_DATE <= timestamp <= END_DATE):
+                        # Accept all recent data (within last 7 days)
+                        if timestamp < START_DATE:
                             continue
                         
                         # Extract text content
@@ -390,12 +415,16 @@ def collect_telegram_data() -> List[Dict[str, Any]]:
                         # Extract price context
                         price_context = extract_price_context(text)
                         
+                        # Safely get URL
+                        url_element = message.select_one('.tgme_widget_message_date')
+                        message_url = str(url_element.get('href', '')) if url_element else ''
+                        
                         message_entry = {
                             'timestamp': timestamp.isoformat(),
                             'source': f"TG:{channel}",
                             'platform': 'telegram',
                             'content': text[:2000],
-                            'url': message.select_one('.tgme_widget_message_date')['href'],
+                            'url': message_url,
                             'content_hash': content_hash,
                             **price_context
                         }
@@ -432,18 +461,21 @@ def collect_blockchain_data() -> List[Dict[str, Any]]:
                         try:
                             # Find time element or skip
                             time_elem = item.select_one('time')
-                            if not time_elem or not time_elem.get('datetime'):
+                            if not time_elem:
                                 continue
                                 
-                            timestamp_str = time_elem['datetime']
+                            timestamp_str = str(time_elem.get('datetime', ''))
+                            if not timestamp_str:
+                                continue
+                                
                             try:
                                 timestamp = datetime.fromisoformat(timestamp_str).astimezone(UTC_TZ)
                             except ValueError:
                                 logger.warning(f"Invalid timestamp format: {timestamp_str}")
                                 continue
                             
-                            # Skip if outside date range
-                            if not (START_DATE <= timestamp <= END_DATE):
+                            # Accept all recent data (within last 7 days)
+                            if timestamp < START_DATE:
                                 continue
                             
                             content = clean_text_content(item.get_text())
@@ -486,8 +518,8 @@ def collect_blockchain_data() -> List[Dict[str, Any]]:
                                 logger.warning(f"Timestamp parsing error: {str(e)}")
                                 continue
                             
-                            # Skip if outside date range
-                            if not (START_DATE <= timestamp <= END_DATE):
+                            # Accept all recent data (within last 7 days)
+                            if timestamp < START_DATE:
                                 continue
                             
                             content = clean_text_content(tx.get_text())
@@ -539,8 +571,8 @@ def organize_into_intervals(data: List[Dict[str, Any]]) -> pd.DataFrame:
         # Format texts for this interval
         texts = []
         for _, row in group.iterrows():
-            source_tag = f"[{row['source']}]" if row['source'] else ""
-            content_preview = row['content'][:150] + '...' if len(row['content']) > 150 else row['content']
+            source_tag = f"[{row['source']}]" if pd.notna(row['source']) and str(row['source']).strip() else ""
+            content_preview = str(row['content'])[:150] + '...' if len(str(row['content'])) > 150 else str(row['content'])
             texts.append(f"{source_tag} {content_preview}")
         
         interval_data.append({
