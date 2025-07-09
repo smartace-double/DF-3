@@ -71,7 +71,7 @@ def get_enhanced_params(trial):
     return {
         'hidden_size': trial.suggest_categorical('hidden_size', [32, 64, 128]),  # Reduced options for faster trials
         'num_layers': trial.suggest_int('num_layers', 1, 2),  # Reduced max layers
-        'lr': trial.suggest_float('lr', 1e-5, 1e-3, log=True),  # Narrowed range
+        'lr': trial.suggest_float('lr', 1e-5, 5e-4, log=True),  # Further narrowed range to prevent NaN
         'batch_size': 1024,  # Fixed optimal batch size for RTX A4000
         'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),  # Narrowed range
         'dropout': trial.suggest_float('dropout', 0.0, 0.3, step=0.1),  # Reduced options
@@ -166,7 +166,7 @@ class BTCDataset:
         print(f"Loading dataset from {self.dataset_path}")
         df = pd.read_csv(self.dataset_path, parse_dates=['timestamp'])
 
-        bias = 15000
+        bias = 650000
         df = df.iloc[bias:]
         
         # Debug: Check data time range
@@ -442,48 +442,52 @@ class EnhancedBitcoinPredictor(nn.Module):
         else:
             self.act_fn = nn.SiLU()
         
-        # Single LSTM encoder for all features (more flexible)
-        self.feature_encoder = nn.LSTM(input_size, hidden_size, num_layers, 
+        # Input preprocessing layer to stabilize gradients
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            self.act_fn,
+            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_size)
+        )
+        
+        # LSTM encoder with proper initialization
+        self.feature_encoder = nn.LSTM(hidden_size, hidden_size, num_layers, 
                                       batch_first=True, dropout=dropout if num_layers > 1 else 0)
         
         # Layer normalization
         if use_layer_norm:
             self.feature_norm = nn.LayerNorm(hidden_size)
 
-        # # Prediction heads
-        # self.point_head = nn.Sequential(
-        #     nn.Linear(hidden_size, hidden_size),
-        #     self.act_fn,
-        #     nn.Dropout(dropout),
-        #     nn.Linear(hidden_size, hidden_size//2),
-        #     self.act_fn,
-        #     nn.Linear(hidden_size//2, 1)
-        # )
-
-        # Prediction heads
+        # Prediction heads with better architecture
         self.point_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
             self.act_fn,
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1)
+            nn.Linear(hidden_size, hidden_size//2),
+            self.act_fn,
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size//2, 1)
         )
         
-        # self.interval_head = nn.Sequential(
-        #     nn.Linear(hidden_size, hidden_size),
-        #     self.act_fn,
-        #     nn.Dropout(dropout),
-        #     nn.Linear(hidden_size, hidden_size//2),
-        #     self.act_fn,
-        #     nn.Linear(hidden_size//2, 2),  # min and max
-        # )
         self.interval_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
             self.act_fn,
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, 2),  # min and max
+            nn.Linear(hidden_size, hidden_size//2),
+            self.act_fn,
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size//2, 2),  # min and max
         )
         
     def forward(self, x):
-        # Encode all features together
-        encoded, _ = self.feature_encoder(x)
+        # Input preprocessing to stabilize gradients
+        batch_size, seq_len, features = x.shape
+        x_reshaped = x.view(-1, features)  # [batch_size * seq_len, features]
+        x_projected = self.input_projection(x_reshaped)  # [batch_size * seq_len, hidden_size]
+        x_projected = x_projected.view(batch_size, seq_len, -1)  # [batch_size, seq_len, hidden_size]
+        
+        # Encode features with LSTM
+        encoded, _ = self.feature_encoder(x_projected)
         
         # Apply layer normalization if enabled
         if self.use_layer_norm:
@@ -843,8 +847,32 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
         activation=params.get('activation', 'SiLU')
     ).to(device)
     
+    # Initialize weights properly to prevent NaN
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight, gain=0.1)  # Smaller gain for stability
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LSTM):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param, gain=0.1)  # Input-to-hidden weights
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param)  # Hidden-to-hidden weights
+                elif 'bias' in name:
+                    nn.init.zeros_(param)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+    
     optimizer = optim.AdamW(model.parameters(), lr=params['lr'], 
                             weight_decay=params['weight_decay'])
+    
+    # Check if model parameters are valid after initialization
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"CRITICAL: NaN/Inf detected in model parameter {name} after initialization")
+            return float('inf')
     
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, 
@@ -893,31 +921,38 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
             
             point_pred, interval_pred = model(batch_X)
             
-            # Debug: Check model output
+            # Debug: Check model output - STOP TRIAL if NaN detected
             if torch.isnan(point_pred).any() or torch.isnan(interval_pred).any():
-                print(f"Warning: NaN detected in model predictions")
+                print(f"CRITICAL: NaN detected in model predictions - Stopping trial")
                 print(f"  point_pred shape: {point_pred.shape}")
                 print(f"  interval_pred shape: {interval_pred.shape}")
                 print(f"  point_pred NaN count: {torch.isnan(point_pred).sum().item()}")
                 print(f"  interval_pred NaN count: {torch.isnan(interval_pred).sum().item()}")
                 print(f"  batch_X range: [{batch_X.min().item():.4f}, {batch_X.max().item():.4f}]")
                 print(f"  batch_y range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
-                continue
+                return float('inf')  # Stop trial immediately
             
             # Challenge-specific loss with scaler for real price evaluation
             loss = challenge_loss(point_pred, interval_pred, batch_y, scaler)
             
-            # Check for NaN loss
+            # Check for NaN loss - STOP TRIAL if NaN detected
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Warning: NaN/Inf loss detected: {loss.item()}")
+                print(f"CRITICAL: NaN/Inf loss detected: {loss.item()} - Stopping trial")
                 print(f"  Point pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
                 print(f"  Interval pred range: [{interval_pred.min().item():.4f}, {interval_pred.max().item():.4f}]")
                 print(f"  Targets range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
-                continue
+                return float('inf')  # Stop trial immediately
             
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), params.get('grad_clip', 1.0))
+            # Check for NaN gradients - STOP TRIAL if NaN detected
+            for name, param in model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"CRITICAL: NaN detected in gradients for {name} - Stopping trial")
+                    return float('inf')  # Stop trial immediately
+            
+            # More aggressive gradient clipping to prevent NaN
+            torch.nn.utils.clip_grad_norm_(model.parameters(), params.get('grad_clip', 0.5))
             optimizer.step()
             scheduler.step()
             
@@ -1011,10 +1046,10 @@ def evaluate_with_progress(model, data_loader, device, scaler=None):
             
             point_pred, interval_pred = model(batch_X)
             
-            # Debug: Check model output in evaluation
+            # Debug: Check model output in evaluation - STOP if NaN detected
             if torch.isnan(point_pred).any() or torch.isnan(interval_pred).any():
-                print(f"Warning: NaN detected in evaluation model predictions")
-                continue
+                print(f"CRITICAL: NaN detected in evaluation model predictions - Stopping evaluation")
+                return float('inf')  # Stop evaluation immediately
             
             # Challenge-specific loss with scaler for real price evaluation
             loss = challenge_loss(point_pred, interval_pred, batch_y, scaler)
@@ -1024,13 +1059,10 @@ def evaluate_with_progress(model, data_loader, device, scaler=None):
             all_interval_preds.append(interval_pred.cpu())
             all_targets.append(batch_y.cpu())
             
-            # Check for NaN loss
+            # Check for NaN loss - STOP if NaN detected
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Warning: NaN/Inf loss in evaluation: {loss.item()}")
-                print(f"  Point pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
-                print(f"  Interval pred range: [{interval_pred.min().item():.4f}, {interval_pred.max().item():.4f}]")
-                print(f"  Targets range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
-                continue
+                print(f"CRITICAL: NaN/Inf loss in evaluation: {loss.item()} - Stopping evaluation")
+                return float('inf')  # Stop evaluation immediately
                 
             total_loss += loss.item()
             
@@ -1285,6 +1317,11 @@ def objective(trial, train_loader, val_loader, scaler=None) -> float:
         
         # Train with CV
         cv_score = train_with_cv(train_loader, val_loader, params, save_dir='models', trial_name=trial_name, scaler=scaler)
+        
+        # Check if trial was stopped due to NaN
+        if cv_score == float('inf'):
+            print(f"{trial_name} STOPPED due to NaN detection")
+            return float('inf')
         
         print(f"{trial_name} completed successfully with score: {cv_score:.4f}")
         return float(cv_score)
