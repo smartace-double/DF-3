@@ -40,6 +40,7 @@ import json
 from typing import Tuple, List, Optional
 import warnings
 import torch.nn.functional as F
+from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 def create_enhanced_study():
@@ -65,19 +66,19 @@ def create_enhanced_study():
         study_name='btc_prediction_opt'
     )
 
-# Enhanced parameter space
+# Enhanced parameter space with fixed batch size
 def get_enhanced_params(trial):
     return {
-        'hidden_size': trial.suggest_categorical('hidden_size', [64, 128, 256, 512, 768]),
-        'num_layers': trial.suggest_int('num_layers', 1, 6),
-        'lr': trial.suggest_float('lr', 1e-6, 1e-3, log=True),
-        'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64, 128, 256]),
-        'weight_decay': trial.suggest_float('weight_decay', 1e-8, 1e-2, log=True),
-        'dropout': trial.suggest_float('dropout', 0.0, 0.5, step=0.05),
-        'epochs': trial.suggest_int('epochs', 2, 10),  # Variable epochs
-        'grad_clip': trial.suggest_float('grad_clip', 0.1, 1.0),
+        'hidden_size': trial.suggest_categorical('hidden_size', [32, 64, 128, 256]),  # Reduced options for faster trials
+        'num_layers': trial.suggest_int('num_layers', 1, 4),  # Reduced max layers
+        'lr': trial.suggest_float('lr', 1e-5, 1e-3, log=True),  # Narrowed range
+        'batch_size': 1024,  # Fixed optimal batch size for RTX A4000
+        'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),  # Narrowed range
+        'dropout': trial.suggest_float('dropout', 0.0, 0.3, step=0.1),  # Reduced options
+        'epochs': trial.suggest_int('epochs', 3, 8),  # Reduced max epochs
+        'grad_clip': trial.suggest_float('grad_clip', 0.5, 1.0),  # Narrowed range
         'use_layer_norm': trial.suggest_categorical('use_layer_norm', [True, False]),
-        'activation': trial.suggest_categorical('activation', ['SiLU', 'GELU', 'Mish'])
+        'activation': trial.suggest_categorical('activation', ['SiLU', 'GELU'])  # Removed Mish for speed
     }
 
 # Enhanced callback with more metrics
@@ -108,6 +109,11 @@ def enhanced_progress_callback(study, trial):
             print(f"  {k}: {v:.3f}")
     except:
         pass
+    
+    # Show progress
+    total_trials = len(study.trials)
+    completed_trials = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    print(f"\nProgress: {completed_trials}/{total_trials} trials completed")
     print(f"{'#'*80}")
 
 # Database integration for resumable studies
@@ -131,10 +137,14 @@ def run_optimization(train_loader, val_loader, scaler=None):
     except:
         pass
     
+    # Progress bar for optimization
+    print(f"\nStarting hyperparameter optimization...")
+    print(f"Target: 50 trials with 24-hour timeout")
+    
     study.optimize(
         lambda trial: objective(trial, train_loader, val_loader, scaler),
-        n_trials=100,  # Increased trial count
-        timeout=48*3600,  # 48 hours
+        n_trials=50,  # Reduced trial count for faster optimization
+        timeout=24*3600,  # 24 hours
         callbacks=[enhanced_progress_callback],
         gc_after_trial=True
     )
@@ -199,9 +209,11 @@ class BTCDataset:
         
         # 7. Create DataLoaders directly (memory efficient)
         print(f"Creating DataLoaders...")
-        train_loader = self.create_dataloader(transformed_train_df, batch_size=32, shuffle=False)  # NO SHUFFLE for time series
-        val_loader = self.create_dataloader(transformed_val_df, batch_size=32, shuffle=False)     # NO SHUFFLE for time series
-        test_loader = self.create_dataloader(transformed_test_df, batch_size=32, shuffle=False)   # NO SHUFFLE for time series
+        # Use fixed optimal batch size
+        batch_size = 512
+        train_loader = self.create_dataloader(transformed_train_df, batch_size=batch_size, shuffle=False)
+        val_loader = self.create_dataloader(transformed_val_df, batch_size=batch_size, shuffle=False)
+        test_loader = self.create_dataloader(transformed_test_df, batch_size=batch_size, shuffle=False)
         
         print(f"DataLoaders created successfully")
         print(f"  Train batches: {len(train_loader)}")
@@ -298,7 +310,7 @@ class BTCDataset:
         print(f"Feature columns: {self.feature_cols}")
         
         dataset = SequenceDataset(df, self.lookback, self.horizon, self.feature_cols, self.target_cols)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=8, pin_memory=True)
     
         
     def clean_data(self, df):
@@ -733,11 +745,15 @@ def train_detailed_predictor(train_loader, val_loader, params, save_dir='models/
     best_val_loss = float('inf')
     epochs = params.get('epochs', 10)
     
+    print(f"Training detailed predictor for {epochs} epochs...")
+    
     for epoch in range(epochs):
-        # Training
+        # Training with progress bar
         model.train()
         train_loss = 0
-        for batch_X, batch_y in train_loader:
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} (Train)', leave=False, ncols=100)
+        
+        for batch_X, batch_y in train_pbar:
             batch_X = batch_X.to(device)
             batch_y = batch_y.to(device)
             
@@ -748,18 +764,26 @@ def train_detailed_predictor(train_loader, val_loader, params, save_dir='models/
             optimizer.step()
             
             train_loss += loss.item()
+            
+            # Update progress bar
+            train_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
         
-        # Validation
+        # Validation with progress bar
         model.eval()
         val_loss = 0
+        val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{epochs} (Val)', leave=False, ncols=100)
+        
         with torch.no_grad():
-            for batch_X, batch_y in val_loader:
+            for batch_X, batch_y in val_pbar:
                 batch_X = batch_X.to(device)
                 batch_y = batch_y.to(device)
                 
                 detailed_pred = model(batch_X)
                 loss = detailed_loss(detailed_pred, batch_y)
                 val_loss += loss.item()
+                
+                # Update progress bar
+                val_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
         
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
@@ -775,15 +799,17 @@ def train_detailed_predictor(train_loader, val_loader, params, save_dir='models/
 
 def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_name=None, scaler=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Enable GPU optimizations
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        print(f"Using GPU: {torch.cuda.get_device_name()}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        print("Using CPU")
+    
     os.makedirs(save_dir, exist_ok=True)
-    
-    # print(f"\n{'='*60}")
-    # print(f"TRIAL: {trial_name}")
-    # print(f"Parameters: {params}")
-    # print(f"{'='*60}")
-    
-    # For now, we'll use a single fold since we're working with DataLoaders
-    # In a full implementation, you'd create multiple DataLoaders for different folds
     
     # Get input size from first batch
     input_size = None
@@ -817,20 +843,23 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
     
     # Training loop
     best_val_score = float('inf')
-    early_stopping = EarlyStopping(patience=5)  # More aggressive early stopping
+    early_stopping = EarlyStopping(patience=3)  # More aggressive early stopping for speed
     train_losses = []
     val_scores = []
     
-    # print(f"Starting training for {params['epochs']} epochs...")
-    # print(f"Batch size: {params['batch_size']}, Learning rate: {params['lr']:.6f}")
+    print(f"Starting training for {params['epochs']} epochs...")
+    print(f"Batch size: {params['batch_size']}, Learning rate: {params['lr']:.6f}")
     
     for epoch in range(params['epochs']):
         model.train()
         train_loss = 0
         batch_count = 0
         
-        # Training phase
-        for batch_idx, (batch_X, batch_y) in enumerate(train_loader):
+        # Training phase with progress bar
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{params["epochs"]} (Train)', 
+                         leave=False, ncols=100)
+        
+        for batch_idx, (batch_X, batch_y) in enumerate(train_pbar):
             batch_X = batch_X.to(device)
             batch_y = batch_y.to(device)
             
@@ -883,14 +912,14 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
             train_loss += loss.item()
             batch_count += 1
             
-            # Print batch progress every 10 batches
-            if batch_idx % 10 == 0:
-                # print(f"  Epoch {epoch+1}/{params['epochs']}, Batch {batch_idx+1}/{len(train_loader)}, "
-                #       f"Loss: {loss.item():.4f}")
-                pass
+            # Update progress bar
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Avg': f'{train_loss/batch_count:.4f}'
+            })
         
-        # Validation
-        val_score = evaluate(model, val_loader, device, scaler)
+        # Validation with progress bar
+        val_score = evaluate_with_progress(model, val_loader, device, scaler)
         avg_train_loss = train_loss / batch_count
         
         # Track losses for monitoring
@@ -898,8 +927,8 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
         val_scores.append(val_score)
         
         # Print epoch progress
-        # print(f"  Epoch {epoch+1}/{params['epochs']}: "
-        #       f"Train Loss = {avg_train_loss:.4f}, Val Score = {val_score:.4f}")
+        print(f"  Epoch {epoch+1}/{params['epochs']}: "
+              f"Train Loss = {avg_train_loss:.4f}, Val Score = {val_score:.4f}")
         
         # Check for overfitting (val score increasing while train loss decreasing)
         if len(val_scores) > 3:
@@ -917,7 +946,7 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
         
         if val_score < best_val_score:
             best_val_score = val_score
-            # print(f"  New best validation score: {best_val_score:.4f}")
+            print(f"  New best validation score: {best_val_score:.4f}")
             # Save best model
             fold_dir = os.path.join(save_dir, 'best_model')
             os.makedirs(fold_dir, exist_ok=True)
@@ -943,9 +972,9 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
     
     return mean_score
 
-def evaluate(model, data_loader, device, scaler=None):
+def evaluate_with_progress(model, data_loader, device, scaler=None):
     """
-    Comprehensive evaluation system that exactly matches the precog subnet scoring system from reward.py.
+    Comprehensive evaluation system with progress bar that exactly matches the precog subnet scoring system from reward.py.
     
     Targets structure: [close_0, low_0, high_0, close_1, low_1, high_1, ..., close_11, low_11, high_11]
     """
@@ -955,8 +984,11 @@ def evaluate(model, data_loader, device, scaler=None):
     all_interval_preds = []
     all_targets = []
     
+    # Progress bar for evaluation
+    eval_pbar = tqdm(data_loader, desc='Evaluation', leave=False, ncols=100)
+    
     with torch.no_grad():
-        for batch_X, batch_y in data_loader:
+        for batch_X, batch_y in eval_pbar:
             batch_X = batch_X.to(device)
             batch_y = batch_y.to(device)
             
@@ -989,6 +1021,9 @@ def evaluate(model, data_loader, device, scaler=None):
                 continue
                 
             total_loss += loss.item()
+            
+            # Update progress bar
+            eval_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
     
     # Check if we have any valid predictions
     if len(all_point_preds) == 0:
@@ -1100,6 +1135,12 @@ def evaluate(model, data_loader, device, scaler=None):
         print(f"  ✅ No major issues detected")
     
     return total_loss / len(data_loader)
+
+def evaluate(model, data_loader, device, scaler=None):
+    """
+    Wrapper function that calls evaluate_with_progress for consistency.
+    """
+    return evaluate_with_progress(model, data_loader, device, scaler)
 
 class EarlyStopping:
     def __init__(self, patience=5):
@@ -1244,10 +1285,11 @@ def objective(trial, train_loader, val_loader, scaler=None) -> float:
 if __name__ == "__main__":
     # Run test first
     print("\nStarting hyperparameter optimization...")
-    print(f"Target: 100 trials with 24-hour timeout")
-    print(f"Each trial: 2 epochs, 5-fold CV")
+    print(f"Target: 50 trials with 24-hour timeout")
+    print(f"Each trial: Variable epochs with early stopping")
     
     # Load dataset ONCE with proper train/val/test split
+    print("Loading dataset...")
     dataset = BTCDataset(dataset_path='datasets/structured_dataset.csv')
     train_loader, val_loader, test_loader = dataset.load_dataset()
     
