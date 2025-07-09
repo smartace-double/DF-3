@@ -690,6 +690,9 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     
     # Combine point and interval losses with 1:1 weight
     total_loss = 0.5 * point_loss + 0.5 * interval_loss
+
+    # TODO: Add a penalty for invalid prediction outside the interval
+    total_loss = total_loss + 10 * (point_pred < min_price_target).float().mean() + 10 * (point_pred > max_price_target).float().mean()
     
     return total_loss
 
