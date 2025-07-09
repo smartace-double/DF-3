@@ -9,7 +9,7 @@ import time
 # ==============================================
 # 1. Configuration
 # ==============================================
-START_DATE = "2025-07-01"  # Changed from future date to historical date
+START_DATE = "2019-01-01"  # Changed from future date to historical date
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 SYMBOL = "BTC/USDT"
 BITQUERY_API_KEY = "e290fc96-40d0-417f-923b-064b93508903"
@@ -1372,11 +1372,18 @@ def build_dataset():
     # Enhanced Liquidation Heatmap
     enhanced_liquidation_data = get_enhanced_liquidation_heatmap()
     if not enhanced_liquidation_data.empty:
+        # Rename columns to avoid conflicts with existing liquidation data
+        enhanced_liquidation_data = enhanced_liquidation_data.rename(columns={
+            'liq_buy': 'liq_enhanced_buy',
+            'liq_sell': 'liq_enhanced_sell'
+        })
         df = df.join(enhanced_liquidation_data, how='left')
         df = df.fillna(0)
         print(f"After enhanced liquidation merge: {df.shape}")
     else:
         # Add empty enhanced liquidation columns if no data
+        df['liq_enhanced_buy'] = 0
+        df['liq_enhanced_sell'] = 0
         df['liq_heatmap_buy'] = 0
         df['liq_heatmap_sell'] = 0
         print("Added empty enhanced liquidation columns")
@@ -1415,7 +1422,7 @@ def build_dataset():
     
     # Enhanced feature columns
     enhanced_onchain_columns = ['exchange_netflow', 'miner_reserves', 'sopr']
-    enhanced_liquidation_columns = ['liq_heatmap_buy', 'liq_heatmap_sell']
+    enhanced_liquidation_columns = ['liq_enhanced_buy', 'liq_enhanced_sell', 'liq_heatmap_buy', 'liq_heatmap_sell']
     enhanced_sentiment_columns = ['sentiment_score', 'engagement', 'sentiment_ma_1h', 'sentiment_ma_4h', 'sentiment_volatility']
     
     # Combine all potential columns (Original + Enhanced)
@@ -1474,7 +1481,7 @@ def build_enhanced_dataset():
         "Technical": ['rsi_14', 'MACD_12_26_9', 'BBL_5_2.0', 'obv', 'vwap'],
         "Enhanced Technical": ['rsi_25', 'rsi_50', 'vw_macd', 'stoch_k', 'stoch_d', 'williams_r', 'atr', 'adx'],
         "Enhanced On-Chain": ['exchange_netflow', 'miner_reserves', 'sopr'],
-        "Enhanced Liquidation": ['liq_heatmap_buy', 'liq_heatmap_sell'],
+        "Enhanced Liquidation": ['liq_enhanced_buy', 'liq_enhanced_sell', 'liq_heatmap_buy', 'liq_heatmap_sell'],
         "Enhanced Sentiment": ['sentiment_score', 'engagement', 'sentiment_ma_1h', 'sentiment_ma_4h', 'sentiment_volatility']
     }
     

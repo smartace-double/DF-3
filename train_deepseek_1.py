@@ -43,6 +43,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
+EPSILON = 1e-4
+
 def create_enhanced_study():
     # Smart sampling with warm-start capabilities
     sampler = TPESampler(
@@ -69,8 +71,8 @@ def create_enhanced_study():
 # Enhanced parameter space with fixed batch size
 def get_enhanced_params(trial):
     return {
-        'hidden_size': trial.suggest_categorical('hidden_size', [32, 64, 128, 256]),  # Reduced options for faster trials
-        'num_layers': trial.suggest_int('num_layers', 1, 4),  # Reduced max layers
+        'hidden_size': trial.suggest_categorical('hidden_size', [32, 64, 128]),  # Reduced options for faster trials
+        'num_layers': trial.suggest_int('num_layers', 1, 2),  # Reduced max layers
         'lr': trial.suggest_float('lr', 1e-5, 1e-3, log=True),  # Narrowed range
         'batch_size': 1024,  # Fixed optimal batch size for RTX A4000
         'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),  # Narrowed range
@@ -152,7 +154,7 @@ def run_optimization(train_loader, val_loader, scaler=None):
     return study
 
 class BTCDataset:
-    def __init__(self, dataset_path='datasets/structured_dataset.csv', lookback=2*12, horizon=12):
+    def __init__(self, dataset_path='datasets/structured_dataset.csv', lookback=6*12, horizon=12):
         self.dataset_path = dataset_path
         self.lookback = lookback
         self.horizon = horizon  # 12 steps = 1 hour (5-minute intervals)
@@ -452,21 +454,21 @@ class EnhancedBitcoinPredictor(nn.Module):
 
         # Prediction heads
         self.point_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            self.act_fn,
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size//2),
-            self.act_fn,
-            nn.Linear(hidden_size//2, 1)
+            # nn.Linear(hidden_size, hidden_size),
+            # self.act_fn,
+            # nn.Dropout(dropout),
+            # nn.Linear(hidden_size, hidden_size//2),
+            # self.act_fn,
+            nn.Linear(hidden_size, 1)
         )
         
         self.interval_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            self.act_fn,
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size//2),
-            self.act_fn,
-            nn.Linear(hidden_size//2, 2),  # min and max
+            # nn.Linear(hidden_size, hidden_size),
+            # self.act_fn,
+            # nn.Dropout(dropout),
+            #   nn.Linear(hidden_size, hidden_size//2),
+            # self.act_fn,
+            nn.Linear(hidden_size, 2),  # min and max
         )
         
     def forward(self, x):
@@ -577,7 +579,7 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     
     # Extract base targets:
     # 1. Exact price 1 hour ahead = close price at the last time step (index 11)
-    exact_price_target = targets_reshaped[:, 11, 0].clamp(min=1e-4)  # close at time step 11
+    exact_price_target = targets_reshaped[:, 11, 0].clamp(min=EPSILON)  # close at time step 11
     
     # 2. Min price during 1-hour period = minimum of all low prices
     min_price_target = targets_reshaped[:, :, 1].min(dim=1)[0]  # min of all low prices
@@ -586,7 +588,7 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     max_price_target = targets_reshaped[:, :, 2].max(dim=1)[0]  # max of all high prices
     
     # 4. All close prices for inclusion factor calculation
-    hour_prices = targets_reshaped[:, :, 0]  # All close prices [batch_size, 12]
+    hour_prices = targets_reshaped[:, :, :].view(-1, 36)  # All high, low, close prices [batch_size, 36]
     
     # Convert scaled predictions back to original scale for price-related features
     if scaler is not None:
@@ -630,7 +632,7 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
         interval_pred = torch.stack([interval_min_unscaled, interval_max_unscaled], dim=1)
     
     # 1. Point Prediction Loss (MAPE for exact 1-hour ahead price)
-    point_mape = torch.abs(point_pred - exact_price_target) / exact_price_target.clamp(min=1e-4)
+    point_mape = torch.abs(point_pred - exact_price_target) / exact_price_target.clamp(min=EPSILON)
     point_loss = point_mape.mean()
 
     # 2. Interval Loss Components (exactly matching reward.py logic)
@@ -638,8 +640,8 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     interval_max = interval_pred[:, 1]
     
     # Ensure valid intervals (min < max)
-    interval_min = torch.minimum(interval_min, interval_max - 1e-4)
-    interval_max = torch.maximum(interval_max, interval_min + 1e-4)
+    interval_min = torch.minimum(interval_min, interval_max - EPSILON)
+    interval_max = torch.maximum(interval_max, interval_min + EPSILON)
     
     # Calculate width factor (f_w) exactly as in reward.py
     # effective_top = min(pred_max, observed_max)
@@ -658,11 +660,14 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
 
     # Debug prints removed to prevent script from stopping
     
-    # Handle case where pred_max == pred_min (invalid interval)
+    # Handle case where pred_max == pred_min (invalid interval) with better numerical stability
+    interval_width = interval_max - interval_min
+    # Add small epsilon to prevent division by zero and numerical instability
+    epsilon = EPSILON
     width_factor = torch.where(
-        interval_max == interval_min,
+        interval_width <= epsilon,
         torch.zeros_like(interval_max),
-        (effective_top - effective_bottom) / (interval_max - interval_min)
+        (effective_top - effective_bottom) / (interval_width + epsilon)
     )
     
     # Calculate inclusion factor (f_i) exactly as in reward.py
@@ -1053,7 +1058,7 @@ def evaluate_with_progress(model, data_loader, device, scaler=None):
     max_price_target = targets_reshaped[:, :, 2].max(dim=1)[0]  # max of all high prices
     
     # 4. All close prices for inclusion factor calculation
-    hour_prices = targets_reshaped[:, :, 0]  # All close prices [batch_size, 12]
+    hour_prices = targets_reshaped[:, :, :].view(-1, 36)  # All high, low, close prices [batch_size, 36]
     
     # Basic data validation
     print(f"  DATA VALIDATION:")
@@ -1066,7 +1071,7 @@ def evaluate_with_progress(model, data_loader, device, scaler=None):
     
     # 1. Point Prediction Analysis (exactly as in reward.py)
     # current_point_error = abs(prediction_value - actual_price) / actual_price
-    point_errors = torch.abs(all_point_preds - exact_price_target) / exact_price_target.clamp(min=1e-4)
+    point_errors = torch.abs(all_point_preds - exact_price_target) / exact_price_target.clamp(min=EPSILON)
     avg_point_error = point_errors.mean().item()
     
     # Additional point metrics
@@ -1077,14 +1082,17 @@ def evaluate_with_progress(model, data_loader, device, scaler=None):
     interval_min = all_interval_preds[:, 0]
     interval_max = all_interval_preds[:, 1]
     
-    # Calculate width factor (f_w) exactly as in reward.py
+    # Calculate width factor (f_w) exactly as in reward.py with numerical stability
     effective_top = torch.minimum(interval_max, max_price_target)
     effective_bottom = torch.maximum(interval_min, min_price_target)
     
+    interval_width = interval_max - interval_min
+    # Add small epsilon to prevent division by zero and numerical instability
+    epsilon = EPSILON
     width_factor = torch.where(
-        interval_max == interval_min,
+        interval_width <= epsilon,
         torch.zeros_like(interval_max),
-        (effective_top - effective_bottom) / (interval_max - interval_min)
+        (effective_top - effective_bottom) / (interval_width + epsilon)
     )
     
     # Calculate inclusion factor (f_i) exactly as in reward.py
