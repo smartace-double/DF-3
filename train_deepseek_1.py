@@ -74,7 +74,7 @@ def get_enhanced_params(trial):
         'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64, 128, 256]),
         'weight_decay': trial.suggest_float('weight_decay', 1e-8, 1e-2, log=True),
         'dropout': trial.suggest_float('dropout', 0.0, 0.5, step=0.05),
-        'epochs': trial.suggest_int('epochs', 2, 5),  # Variable epochs
+        'epochs': trial.suggest_int('epochs', 2, 10),  # Variable epochs
         'grad_clip': trial.suggest_float('grad_clip', 0.1, 1.0),
         'use_layer_norm': trial.suggest_categorical('use_layer_norm', [True, False]),
         'activation': trial.suggest_categorical('activation', ['SiLU', 'GELU', 'Mish'])
@@ -133,7 +133,7 @@ def run_optimization(train_loader, val_loader, scaler=None):
     
     study.optimize(
         lambda trial: objective(trial, train_loader, val_loader, scaler),
-        n_trials=1,  # Increased trial count
+        n_trials=100,  # Increased trial count
         timeout=48*3600,  # 48 hours
         callbacks=[enhanced_progress_callback],
         gc_after_trial=True
@@ -155,13 +155,16 @@ class BTCDataset:
         """Load and preprocess the dataset with proper train/val/test split"""
         print(f"Loading dataset from {self.dataset_path}")
         df = pd.read_csv(self.dataset_path, parse_dates=['timestamp'])
+
+        bias = 15000
+        df = df.iloc[bias:]
         
         # Debug: Check data time range
-        print(f"DEBUG: Dataset time range:")
-        print(f"  Start: {df['timestamp'].min()}")
-        print(f"  End: {df['timestamp'].max()}")
-        print(f"  Total rows: {len(df)}")
-        print(f"  Close price range: [{df['close'].min():.2f}, {df['close'].max():.2f}]")
+        # print(f"DEBUG: Dataset time range:")
+        # print(f"  Start: {df['timestamp'].min()}")
+        # print(f"  End: {df['timestamp'].max()}")
+        # print(f"  Total rows: {len(df)}")
+        # print(f"  Close price range: [{df['close'].min():.2f}, {df['close'].max():.2f}]")
         
         # 1. Clean the data first
         print(f"Cleaning data...")
@@ -236,7 +239,12 @@ class BTCDataset:
         # Drop rows with NaN targets (end of dataset)
         self.target_cols = [col for i in range(self.horizon) 
                    for col in (f'target_close_{i}', f'target_low_{i}', f'target_high_{i}')]
+        
+        print(f"Created {len(self.target_cols)} target columns")
+        print(f"Target columns: {self.target_cols[:6]}...")  # Show first 6 columns
+        
         df = df.dropna(subset=self.target_cols)
+        print(f"After dropping NaN targets: {len(df)} rows remaining")
         
         return df
     
@@ -268,6 +276,13 @@ class BTCDataset:
                     target_data = self.df[self.target_cols].iloc[i].values
                 else:
                     target_data = self.df[i, self.target_cols]
+                
+                # Debug: Check for NaN in target data
+                if np.isnan(target_data).any():
+                    print(f"Warning: NaN detected in target data at index {i}")
+                    print(f"  Target data shape: {target_data.shape}")
+                    print(f"  NaN count: {np.isnan(target_data).sum()}")
+                    print(f"  Target columns: {self.target_cols[:6]}...")
                 
                 return torch.FloatTensor(feature_data), torch.FloatTensor(target_data)
         
@@ -528,17 +543,38 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     """
     Loss function that exactly matches the precog subnet scoring system from reward.py.
     
+    Targets structure: [close_0, low_0, high_0, close_1, low_1, high_1, ..., close_11, low_11, high_11]
+    
     The loss encourages:
     1. Accurate point predictions for the exact 1-hour ahead price
     2. Well-calibrated intervals that maximize inclusion_factor * width_factor
     """
-    # Extract targets
-    exact_price_target = targets[:, 0].clamp(min=1e-4)  # Price at exactly 1 hour ahead
-    min_price_target = targets[:, 1]  # Minimum price during the 1-hour period
-    max_price_target = targets[:, 2]  # Maximum price during the 1-hour period
+    # Extract targets from the new structure
+    # targets has shape [batch_size, 36] where 36 = 12 time steps * 3 values (close, low, high)
+    # We need to derive the base targets from these detailed targets
     
-    # Extract close prices for each 5-min interval in the hour
-    hour_prices = targets[:, 0::3]  # Take every 3rd value starting at index 3 to get close prices
+    # Debug: Check target shape and values
+    if torch.isnan(targets).any():
+        print(f"Warning: NaN detected in targets in challenge_loss")
+        print(f"  targets shape: {targets.shape}")
+        print(f"  NaN count: {torch.isnan(targets).sum().item()}")
+        return torch.tensor(float('inf'), device=point_pred.device)
+    
+    # Reshape targets to [batch_size, 12, 3] for easier processing
+    targets_reshaped = targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [close, low, high]
+    
+    # Extract base targets:
+    # 1. Exact price 1 hour ahead = close price at the last time step (index 11)
+    exact_price_target = targets_reshaped[:, 11, 0].clamp(min=1e-4)  # close at time step 11
+    
+    # 2. Min price during 1-hour period = minimum of all low prices
+    min_price_target = targets_reshaped[:, :, 1].min(dim=1)[0]  # min of all low prices
+    
+    # 3. Max price during 1-hour period = maximum of all high prices  
+    max_price_target = targets_reshaped[:, :, 2].max(dim=1)[0]  # max of all high prices
+    
+    # 4. All close prices for inclusion factor calculation
+    hour_prices = targets_reshaped[:, :, 0]  # All close prices [batch_size, 12]
     
     # Convert scaled predictions back to original scale for price-related features
     if scaler is not None:
@@ -552,13 +588,13 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
         price_indices = [3, 1, 2]  # [close, high, low] indices
         
         # Debug: Print scaler info
-        print(f"DEBUG: Scaler mean shape: {mean_.shape}, scale shape: {scale_.shape}")
-        print(f"DEBUG: Price indices: {price_indices}")
-        print(f"DEBUG: Scaler mean for close: {mean_[price_indices[0]]:.4f}, scale: {scale_[price_indices[0]]:.4f}")
-        print(f"DEBUG: Before inverse transform - point_pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
-        print(f"DEBUG: Before inverse transform - exact_price_target range: [{exact_price_target.min().item():.4f}, {exact_price_target.max().item():.4f}]")
-        print(f"DEBUG: Sample point_pred: {point_pred[:3]}")
-        print(f"DEBUG: Sample exact_price_target: {exact_price_target[:3]}")
+        # print(f"DEBUG: Scaler mean shape: {mean_.shape}, scale shape: {scale_.shape}")
+        # print(f"DEBUG: Price indices: {price_indices}")
+        # print(f"DEBUG: Scaler mean for close: {mean_[price_indices[0]]:.4f}, scale: {scale_[price_indices[0]]:.4f}")
+        # print(f"DEBUG: Before inverse transform - point_pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
+        # print(f"DEBUG: Before inverse transform - exact_price_target range: [{exact_price_target.min().item():.4f}, {exact_price_target.max().item():.4f}]")
+        # print(f"DEBUG: Sample point_pred: {point_pred[:3]}")
+        # print(f"DEBUG: Sample exact_price_target: {exact_price_target[:3]}")
         
         # Manual inverse transform for price predictions (maintains gradients)
         point_pred_unscaled = point_pred * scale_[price_indices[0]] + mean_[price_indices[0]]
@@ -567,15 +603,15 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
         
         
         # Debug: Show target transformation
-        print(f"DEBUG: Target transformation:")
-        print(f"  exact_price_target (already real): {exact_price_target[:5]}")
-        print(f"  min_price_target (already real): {min_price_target[:5]}")
-        print(f"  max_price_target (already real): {max_price_target[:5]}")
+        # print(f"DEBUG: Target transformation:")
+        # print(f"  exact_price_target (already real): {exact_price_target[:5]}")
+        # print(f"  min_price_target (already real): {min_price_target[:5]}")
+        # print(f"  max_price_target (already real): {max_price_target[:5]}")
         
         
-        # Debug: Print after inverse transform
-        print(f"DEBUG: After inverse transform - point_pred range: [{point_pred_unscaled.min().item():.4f}, {point_pred_unscaled.max().item():.4f}]")
-        print(f"DEBUG: After inverse transform - exact_price_target range: [{exact_price_target.min().item():.4f}, {exact_price_target.max().item():.4f}]")
+        # # Debug: Print after inverse transform
+        # print(f"DEBUG: After inverse transform - point_pred range: [{point_pred_unscaled.min().item():.4f}, {point_pred_unscaled.max().item():.4f}]")
+        # print(f"DEBUG: After inverse transform - exact_price_target range: [{exact_price_target.min().item():.4f}, {exact_price_target.max().item():.4f}]")
         
         # Use unscaled values for calculations
         point_pred = point_pred_unscaled
@@ -646,16 +682,13 @@ def detailed_loss(detailed_pred, targets):
     
     Args:
         detailed_pred: [batch_size, 12, 3] predictions for close, low, high at each time step
-        targets: [batch_size, 39] targets including base targets and detailed targets
+        targets: [batch_size, 36] targets with detailed close, low, high for each time step
     
     Returns:
         MSE loss for detailed predictions
     """
-    # Extract detailed targets: [close_0, low_0, high_0, close_1, low_1, high_1, ..., close_11, low_11, high_11]
-    detailed_targets = targets[:, 3:]  # Skip the first 3 base targets
-    
-    # Reshape detailed targets to [batch_size, 12, 3] to match detailed_pred
-    detailed_targets = detailed_targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [close, low, high]
+    # Reshape targets to [batch_size, 12, 3] to match detailed_pred
+    detailed_targets = targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [close, low, high]
     
     # Calculate MSE loss for detailed predictions
     return F.mse_loss(detailed_pred, detailed_targets)
@@ -761,8 +794,8 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
     if input_size is None:
         print("Error: No valid batches found in train_loader")
         return float('inf')
-        
-        # Initialize model
+    
+    # Initialize model
     model = EnhancedBitcoinPredictor(
         input_size=input_size,
         hidden_size=params['hidden_size'],
@@ -810,6 +843,13 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
                 print(f"  NaN count: {torch.isnan(batch_X).sum().item()}")
                 continue
             
+            # Debug: Check target data
+            if torch.isnan(batch_y).any():
+                print(f"Warning: NaN detected in target data")
+                print(f"  batch_y shape: {batch_y.shape}")
+                print(f"  NaN count: {torch.isnan(batch_y).sum().item()}")
+                continue
+            
             point_pred, interval_pred = model(batch_X)
             
             # Debug: Check model output
@@ -819,6 +859,8 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
                 print(f"  interval_pred shape: {interval_pred.shape}")
                 print(f"  point_pred NaN count: {torch.isnan(point_pred).sum().item()}")
                 print(f"  interval_pred NaN count: {torch.isnan(interval_pred).sum().item()}")
+                print(f"  batch_X range: [{batch_X.min().item():.4f}, {batch_X.max().item():.4f}]")
+                print(f"  batch_y range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
                 continue
             
             # Challenge-specific loss with scaler for real price evaluation
@@ -905,6 +947,7 @@ def evaluate(model, data_loader, device, scaler=None):
     """
     Comprehensive evaluation system that exactly matches the precog subnet scoring system from reward.py.
     
+    Targets structure: [close_0, low_0, high_0, close_1, low_1, high_1, ..., close_11, low_11, high_11]
     """
     model.eval()
     total_loss = 0
@@ -958,12 +1001,24 @@ def evaluate(model, data_loader, device, scaler=None):
     all_targets = torch.cat(all_targets, dim=0)
     
     # Extract targets exactly as in reward.py
-    exact_price_target = all_targets[:, 0]  # Price at exactly 1 hour ahead
-    min_price_target = all_targets[:, 1]    # Minimum price during the 1-hour period
-    max_price_target = all_targets[:, 2]    # Maximum price during the 1-hour period
+    # targets has shape [batch_size, 36] where 36 = 12 time steps * 3 values (close, low, high)
+    # We need to derive the base targets from these detailed targets
     
-    # Extract close prices for each 5-min interval in the hour
-    hour_prices = all_targets[:, 0::3]  # Take every 3rd value starting at index 3 to get close prices
+    # Reshape targets to [batch_size, 12, 3] for easier processing
+    targets_reshaped = all_targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [close, low, high]
+    
+    # Extract base targets:
+    # 1. Exact price 1 hour ahead = close price at the last time step (index 11)
+    exact_price_target = targets_reshaped[:, 11, 0]  # close at time step 11
+    
+    # 2. Min price during 1-hour period = minimum of all low prices
+    min_price_target = targets_reshaped[:, :, 1].min(dim=1)[0]  # min of all low prices
+    
+    # 3. Max price during 1-hour period = maximum of all high prices  
+    max_price_target = targets_reshaped[:, :, 2].max(dim=1)[0]  # max of all high prices
+    
+    # 4. All close prices for inclusion factor calculation
+    hour_prices = targets_reshaped[:, :, 0]  # All close prices [batch_size, 12]
     
     # Basic data validation
     print(f"  DATA VALIDATION:")
@@ -1151,6 +1206,8 @@ class ContinuousLearner:
             
             # Calculate metrics
             loss = challenge_loss(point_pred, interval_pred, val_y, self.scaler)
+
+            print(f"Validation loss: {loss.item()}")
             
         self.model.train()
     
