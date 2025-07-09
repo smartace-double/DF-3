@@ -69,8 +69,8 @@ def create_enhanced_study():
 # Enhanced parameter space with fixed batch size
 def get_enhanced_params(trial):
     return {
-        'hidden_size': trial.suggest_categorical('hidden_size', [32, 64, 128, 256]),  # Reduced options for faster trials
-        'num_layers': trial.suggest_int('num_layers', 1, 4),  # Reduced max layers
+        'hidden_size': trial.suggest_categorical('hidden_size', [32, 64, 128]),  # Reduced options for faster trials
+        'num_layers': trial.suggest_int('num_layers', 1, 2),  # Reduced max layers
         'lr': trial.suggest_float('lr', 1e-5, 1e-3, log=True),  # Narrowed range
         'batch_size': 1024,  # Fixed optimal batch size for RTX A4000
         'weight_decay': trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True),  # Narrowed range
@@ -422,7 +422,7 @@ class BTCDataset:
         return df
 
 class EnhancedBitcoinPredictor(nn.Module):
-    def __init__(self, input_size, hidden_size=256, num_layers=3, dropout=0.1, 
+    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.1, 
                  use_layer_norm=True, activation='SiLU'):
         super().__init__()
         
@@ -450,23 +450,35 @@ class EnhancedBitcoinPredictor(nn.Module):
         if use_layer_norm:
             self.feature_norm = nn.LayerNorm(hidden_size)
 
+        # # Prediction heads
+        # self.point_head = nn.Sequential(
+        #     nn.Linear(hidden_size, hidden_size),
+        #     self.act_fn,
+        #     nn.Dropout(dropout),
+        #     nn.Linear(hidden_size, hidden_size//2),
+        #     self.act_fn,
+        #     nn.Linear(hidden_size//2, 1)
+        # )
+
         # Prediction heads
         self.point_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
             self.act_fn,
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size//2),
-            self.act_fn,
-            nn.Linear(hidden_size//2, 1)
+            nn.Linear(hidden_size, 1)
         )
         
+        # self.interval_head = nn.Sequential(
+        #     nn.Linear(hidden_size, hidden_size),
+        #     self.act_fn,
+        #     nn.Dropout(dropout),
+        #     nn.Linear(hidden_size, hidden_size//2),
+        #     self.act_fn,
+        #     nn.Linear(hidden_size//2, 2),  # min and max
+        # )
         self.interval_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
             self.act_fn,
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size//2),
-            self.act_fn,
-            nn.Linear(hidden_size//2, 2),  # min and max
+            nn.Linear(hidden_size, 2),  # min and max
         )
         
     def forward(self, x):
