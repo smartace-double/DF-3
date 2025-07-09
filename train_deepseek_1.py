@@ -7,7 +7,11 @@ The model predicts:
 1. Point prediction: Exact BTC price 1 hour ahead
 2. Interval prediction: [min, max] range for the entire 1-hour period
 
-Target structure: [exact_price_1h_ahead, min_price_1h_period, max_price_1h_period]
+Target structure: [exact_price_1h_ahead, min_price_1h_period, max_price_1h_period, 
+                  close_0, low_0, high_0, close_1, low_1, high_1, ..., close_11, low_11, high_11]
+
+Note: Detailed predictions (close, low, high for every 5 minutes) are available as a separate 
+DetailedBitcoinPredictor class that can be used later for additional analysis.
 
 This matches the precog subnet scoring system where:
 - Miners predict at time T for time T+1 hour
@@ -144,12 +148,20 @@ class BTCDataset:
         self.horizon = horizon  # 12 steps = 1 hour (5-minute intervals)
         self.scaler = StandardScaler()
         self.feature_cols = []  # Will be set during preprocessing
+        self.target_cols = []  # Will be set during preprocessing
         self.scaler_fitted = False
 
     def load_dataset(self):
         """Load and preprocess the dataset with proper train/val/test split"""
         print(f"Loading dataset from {self.dataset_path}")
         df = pd.read_csv(self.dataset_path, parse_dates=['timestamp'])
+        
+        # Debug: Check data time range
+        print(f"DEBUG: Dataset time range:")
+        print(f"  Start: {df['timestamp'].min()}")
+        print(f"  End: {df['timestamp'].max()}")
+        print(f"  Total rows: {len(df)}")
+        print(f"  Close price range: [{df['close'].min():.2f}, {df['close'].max():.2f}]")
         
         # 1. Clean the data first
         print(f"Cleaning data...")
@@ -164,27 +176,29 @@ class BTCDataset:
         print(f"Splitting data into train/val/test...")
         train_df, val_df, test_df = self.split_data(df)
         
+        # create targets before scaling
+        train_df = self.create_targets(train_df)
+        val_df = self.create_targets(val_df)
+        test_df = self.create_targets(test_df)
+
         # 4. Fit scaler on training data only
         print(f"Fitting scaler on training data...")
         self.fit_scaler(train_df)
+        # apply scaler transform to train, val and test data
+        transformed_train_df = self.transform_data(train_df, self.scaler)
+        transformed_val_df = self.transform_data(val_df, self.scaler)
+        transformed_test_df = self.transform_data(test_df, self.scaler)
         
-        # 5. Transform all datasets
-        print(f"Transforming data...")
-        train_df_scaled = self.transform_data(train_df)
-        val_df_scaled = self.transform_data(val_df)
-        test_df_scaled = self.transform_data(test_df)
         
-        # 6. Create targets AFTER scaling (to avoid data leakage)
-        print(f"Creating targets...")
-        train_df_with_targets = self.create_targets(train_df_scaled)
-        val_df_with_targets = self.create_targets(val_df_scaled)
-        test_df_with_targets = self.create_targets(test_df_scaled)
+        # 5. Fit scaler on training data only (excluding target columns)
+        
+        # 6. Transform all datasets (excluding target columns)
         
         # 7. Create DataLoaders directly (memory efficient)
         print(f"Creating DataLoaders...")
-        train_loader = self.create_dataloader(train_df_with_targets, batch_size=32, shuffle=True)  # Reduced batch size
-        val_loader = self.create_dataloader(val_df_with_targets, batch_size=32, shuffle=False)    # Reduced batch size
-        test_loader = self.create_dataloader(test_df_with_targets, batch_size=32, shuffle=False)  # Reduced batch size
+        train_loader = self.create_dataloader(transformed_train_df, batch_size=32, shuffle=False)  # NO SHUFFLE for time series
+        val_loader = self.create_dataloader(transformed_val_df, batch_size=32, shuffle=False)     # NO SHUFFLE for time series
+        test_loader = self.create_dataloader(transformed_test_df, batch_size=32, shuffle=False)   # NO SHUFFLE for time series
         
         print(f"DataLoaders created successfully")
         print(f"  Train batches: {len(train_loader)}")
@@ -197,7 +211,7 @@ class BTCDataset:
         """Split data into train/val/test sets"""
         total_rows = len(df)
         
-        # Use 70% train, 15% val, 15% test
+        # Use 85% train, 10% val, 5% test
         train_end = int(0.85 * total_rows)
         val_end = int(0.95 * total_rows)
         
@@ -209,84 +223,68 @@ class BTCDataset:
         return train_df, val_df, test_df
     
     def create_targets(self, df):
-        """Create targets that match precog subnet requirements"""
-        # 1. Point target: exact price 1 hour ahead (horizon steps)
-        df['target_close'] = df['close'].shift(-self.horizon)
+        """Create targets that match precog subnet requirements with detailed price information"""
         
-        # 2. Interval targets: min and max during the 1-hour period
-        # Calculate rolling min/max over the next hour (horizon steps)
-        df['target_low'] = df['low'].rolling(window=self.horizon, min_periods=1).min().shift(-self.horizon)
-        df['target_high'] = df['high'].rolling(window=self.horizon, min_periods=1).max().shift(-self.horizon)
-        
-        # 3. Add all price points within the 1-hour period for inclusion factor calculation
-        # We need to collect all close prices within the next hour for each timestep
         for i in range(self.horizon):
-            df[f'target_price_{i}'] = df['close'].shift(-i-1)
+            # Close price at time step i+1 (1 hour ahead)
+            df[f'target_close_{i}'] = df['close'].shift(-i-1)
+            # Low price at time step i+1
+            df[f'target_low_{i}'] = df['low'].shift(-i-1)
+            # High price at time step i+1
+            df[f'target_high_{i}'] = df['high'].shift(-i-1)
         
         # Drop rows with NaN targets (end of dataset)
-        target_cols = ['target_close', 'target_low', 'target_high'] + [f'target_price_{i}' for i in range(self.horizon)]
-        df = df.dropna(subset=target_cols)
+        self.target_cols = [col for i in range(self.horizon) 
+                   for col in (f'target_close_{i}', f'target_low_{i}', f'target_high_{i}')]
+        df = df.dropna(subset=self.target_cols)
         
         return df
     
-    def create_dataloader(self, df, batch_size=64, shuffle=True):
+    def create_dataloader(self, df, batch_size=64, shuffle=False):
         """Create a memory-efficient DataLoader that generates sequences on-the-fly"""
         class SequenceDataset(torch.utils.data.Dataset):
-            def __init__(self, df, lookback, horizon, feature_cols):
+            def __init__(self, df, lookback, horizon, feature_cols, target_cols):
                 self.df = df
                 self.lookback = lookback
                 self.horizon = horizon
                 self.feature_cols = feature_cols
+                self.target_cols = target_cols
                 self.max_i = len(df) - lookback - horizon
-                # Limit to first 1000 samples to prevent memory issues
-                self.max_i = min(1000, self.max_i)
+
             
             def __len__(self):
-                # Limit to 1000 samples to prevent memory issues
-                return min(1000, max(0, self.max_i - self.lookback))
+                return max(0, self.max_i - self.lookback)
             
             def __getitem__(self, idx):
                 i = idx + self.lookback
                 
                 # Features (lookback window) - exclude target columns
-                feature_data = self.df[self.feature_cols].iloc[i-self.lookback:i].values
+                if isinstance(self.df, pd.DataFrame):
+                    feature_data = self.df[self.feature_cols].iloc[i-self.lookback:i].values
+                else:
+                    feature_data = self.df[i-self.lookback:i, self.feature_cols]
                 
-                # Targets: [exact_price_1h_ahead, min_price_1h_period, max_price_1h_period, all_prices_1h_period...]
-                target_data = self.df[['target_close', 'target_low', 'target_high'] + [f'target_price_{j}' for j in range(self.horizon)]].iloc[i].values
+                if isinstance(self.df, pd.DataFrame):
+                    target_data = self.df[self.target_cols].iloc[i].values
+                else:
+                    target_data = self.df[i, self.target_cols]
                 
                 return torch.FloatTensor(feature_data), torch.FloatTensor(target_data)
         
         # Set feature columns if not already set
         if not self.feature_cols:
-            self.feature_cols = [col for col in df.columns if not col.startswith('target_')]
+            # Handle both DataFrame and numpy array cases
+            if hasattr(df, 'columns'):
+                self.feature_cols = [col for col in df.columns if not col.startswith('target_')]
+            else:
+                # If df is a numpy array, assume all columns are features
+                self.feature_cols = list(range(df.shape[1]))
+
+        print(f"Feature columns: {self.feature_cols}")
         
-        dataset = SequenceDataset(df, self.lookback, self.horizon, self.feature_cols)
+        dataset = SequenceDataset(df, self.lookback, self.horizon, self.feature_cols, self.target_cols)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
     
-    def create_sequences(self, df):
-        """Create time series sequences (kept for backward compatibility)"""
-        X, y = [], []
-        
-        # Ensure we don't go out of bounds
-        max_i = len(df) - self.lookback - self.horizon
-        
-        for i in range(self.lookback, max_i): 
-            # Features (lookback window) - exclude target columns
-            feature_cols = [col for col in df.columns if not col.startswith('target_')]
-            if not self.feature_cols:  # Set once
-                self.feature_cols = feature_cols
-            
-            feature_data = df[self.feature_cols].iloc[i-self.lookback:i].values
-            X.append(feature_data)
-            
-            # Targets: [exact_price_1h_ahead, min_price_1h_period, max_price_1h_period, all_prices_1h_period...]
-            # Get targets at position i (current time), which were created for i+horizon
-            target_data = df[['target_close', 'target_low', 'target_high'] + [f'target_price_{j}' for j in range(self.horizon)]].iloc[i].values
-            y.append(target_data)
-        # convert to numpy arrays and tensors
-        X = torch.FloatTensor(X)
-        y = torch.FloatTensor(y)
-        return X, y
         
     def clean_data(self, df):
         """Handles missing values, outliers, and normalization"""
@@ -335,20 +333,21 @@ class BTCDataset:
             self.scaler.fit(feature_data)
             self.scaler_fitted = True
             print(f"Scaler fitted on {len(feature_data)} training samples with {len(feature_cols)} features")
+            print(f"Feature columns: {feature_cols}")
     
-    def transform_data(self, df):
-        """Transform data using fitted scaler"""
-        if not self.scaler_fitted:
-            raise ValueError("Scaler must be fitted before transforming")
+    def transform_data(self, df, scaler=None):
+        """Transform data using the fitted scaler"""
+        if scaler is None:
+            raise ValueError("Scaler not fitted. Please fit the scaler first.")
         
         # Get feature columns (exclude target columns)
         feature_cols = [col for col in df.columns if not col.startswith('target_')]
         feature_data = df[feature_cols].values
         
         # Transform features
-        feature_data_scaled = self.scaler.transform(feature_data)
+        feature_data_scaled = scaler.transform(feature_data)
         
-        # Create new dataframe with scaled features
+        # Create new dataframe with scaled features (keep target columns unchanged)
         df_scaled = df.copy()
         for i, col in enumerate(feature_cols):
             df_scaled.loc[:, col] = feature_data_scaled[:, i]
@@ -463,11 +462,71 @@ class EnhancedBitcoinPredictor(nn.Module):
         
         return point_pred.squeeze(), interval_pred
 
+class DetailedBitcoinPredictor(nn.Module):
+    """
+    Separate predictor class for detailed price predictions.
+    This can be used later for predicting close, low, high at each time step.
+    """
+    def __init__(self, input_size, hidden_size=256, num_layers=3, dropout=0.1, 
+                 use_layer_norm=True, activation='SiLU'):
+        super().__init__()
+        
+        self.hidden_size = hidden_size
+        self.dropout = dropout
+        self.use_layer_norm = use_layer_norm
+        self.activation = activation
+        self.input_size = input_size
+        
+        # Choose activation function
+        if activation == 'SiLU':
+            self.act_fn = nn.SiLU()
+        elif activation == 'GELU':
+            self.act_fn = nn.GELU()
+        elif activation == 'Mish':
+            self.act_fn = nn.Mish()
+        else:
+            self.act_fn = nn.SiLU()
+        
+        # LSTM encoder for all features
+        self.feature_encoder = nn.LSTM(input_size, hidden_size, num_layers, 
+                                      batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        
+        # Layer normalization
+        if use_layer_norm:
+            self.feature_norm = nn.LayerNorm(hidden_size)
+
+        # Detailed prediction head for close, low, high at each time step
+        self.detailed_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            self.act_fn,
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size//2),
+            self.act_fn,
+            nn.Linear(hidden_size//2, 3 * 12)  # 3 values (close, low, high) * 12 time steps
+        )
+        
+    def forward(self, x):
+        # Encode all features together
+        encoded, _ = self.feature_encoder(x)
+        
+        # Apply layer normalization if enabled
+        if self.use_layer_norm:
+            encoded = self.feature_norm(encoded)
+        
+        # Use the last timestep for prediction
+        final_encoding = encoded[:, -1]
+        
+        # Detailed predictions
+        detailed_pred = self.detailed_head(final_encoding)
+        
+        # Reshape detailed predictions to [batch_size, 12, 3] (12 time steps, 3 values each)
+        detailed_pred = detailed_pred.view(-1, 12, 3)  # [batch_size, 12, 3] for [close, low, high]
+        
+        return detailed_pred
+
 def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     """
     Loss function that exactly matches the precog subnet scoring system from reward.py.
-    
-    Targets structure: [exact_price_1h_ahead, min_price_1h_period, max_price_1h_period, price_1, price_2, ..., price_12]
     
     The loss encourages:
     1. Accurate point predictions for the exact 1-hour ahead price
@@ -478,8 +537,8 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     min_price_target = targets[:, 1]  # Minimum price during the 1-hour period
     max_price_target = targets[:, 2]  # Maximum price during the 1-hour period
     
-    # Extract all price points within the 1-hour period (for inclusion factor calculation)
-    hour_prices = targets[:, 3:]  # All price points within the hour
+    # Extract close prices for each 5-min interval in the hour
+    hour_prices = targets[:, 0::3]  # Take every 3rd value starting at index 3 to get close prices
     
     # Convert scaled predictions back to original scale for price-related features
     if scaler is not None:
@@ -495,33 +554,32 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
         # Debug: Print scaler info
         print(f"DEBUG: Scaler mean shape: {mean_.shape}, scale shape: {scale_.shape}")
         print(f"DEBUG: Price indices: {price_indices}")
+        print(f"DEBUG: Scaler mean for close: {mean_[price_indices[0]]:.4f}, scale: {scale_[price_indices[0]]:.4f}")
         print(f"DEBUG: Before inverse transform - point_pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
         print(f"DEBUG: Before inverse transform - exact_price_target range: [{exact_price_target.min().item():.4f}, {exact_price_target.max().item():.4f}]")
+        print(f"DEBUG: Sample point_pred: {point_pred[:3]}")
+        print(f"DEBUG: Sample exact_price_target: {exact_price_target[:3]}")
         
         # Manual inverse transform for price predictions (maintains gradients)
         point_pred_unscaled = point_pred * scale_[price_indices[0]] + mean_[price_indices[0]]
         interval_min_unscaled = interval_pred[:, 0] * scale_[price_indices[1]] + mean_[price_indices[1]]
         interval_max_unscaled = interval_pred[:, 1] * scale_[price_indices[2]] + mean_[price_indices[2]]
         
-        # Manual inverse transform for targets
-        exact_price_target_unscaled = exact_price_target * scale_[price_indices[0]] + mean_[price_indices[0]]
-        min_price_target_unscaled = min_price_target * scale_[price_indices[1]] + mean_[price_indices[1]]
-        max_price_target_unscaled = max_price_target * scale_[price_indices[2]] + mean_[price_indices[2]]
         
-        # Manual inverse transform for hour prices
-        hour_prices_unscaled = hour_prices * scale_[price_indices[0]].unsqueeze(0) + mean_[price_indices[0]].unsqueeze(0)
+        # Debug: Show target transformation
+        print(f"DEBUG: Target transformation:")
+        print(f"  exact_price_target (already real): {exact_price_target[:5]}")
+        print(f"  min_price_target (already real): {min_price_target[:5]}")
+        print(f"  max_price_target (already real): {max_price_target[:5]}")
+        
         
         # Debug: Print after inverse transform
         print(f"DEBUG: After inverse transform - point_pred range: [{point_pred_unscaled.min().item():.4f}, {point_pred_unscaled.max().item():.4f}]")
-        print(f"DEBUG: After inverse transform - exact_price_target range: [{exact_price_target_unscaled.min().item():.4f}, {exact_price_target_unscaled.max().item():.4f}]")
+        print(f"DEBUG: After inverse transform - exact_price_target range: [{exact_price_target.min().item():.4f}, {exact_price_target.max().item():.4f}]")
         
         # Use unscaled values for calculations
         point_pred = point_pred_unscaled
         interval_pred = torch.stack([interval_min_unscaled, interval_max_unscaled], dim=1)
-        exact_price_target = exact_price_target_unscaled
-        min_price_target = min_price_target_unscaled
-        max_price_target = max_price_target_unscaled
-        hour_prices = hour_prices_unscaled
     
     # 1. Point Prediction Loss (MAPE for exact 1-hour ahead price)
     point_mape = torch.abs(point_pred - exact_price_target) / exact_price_target.clamp(min=1e-4)
@@ -582,12 +640,109 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     
     return total_loss
 
+def detailed_loss(detailed_pred, targets):
+    """
+    Loss function for detailed predictions.
+    
+    Args:
+        detailed_pred: [batch_size, 12, 3] predictions for close, low, high at each time step
+        targets: [batch_size, 39] targets including base targets and detailed targets
+    
+    Returns:
+        MSE loss for detailed predictions
+    """
+    # Extract detailed targets: [close_0, low_0, high_0, close_1, low_1, high_1, ..., close_11, low_11, high_11]
+    detailed_targets = targets[:, 3:]  # Skip the first 3 base targets
+    
+    # Reshape detailed targets to [batch_size, 12, 3] to match detailed_pred
+    detailed_targets = detailed_targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [close, low, high]
+    
+    # Calculate MSE loss for detailed predictions
+    return F.mse_loss(detailed_pred, detailed_targets)
+
+def train_detailed_predictor(train_loader, val_loader, params, save_dir='models/detailed', scaler=None):
+    """
+    Example function showing how to train the DetailedBitcoinPredictor.
+    This can be used later when you need detailed predictions.
+    
+    Args:
+        train_loader: Training data loader
+        val_loader: Validation data loader  
+        params: Model parameters
+        save_dir: Directory to save the model
+        scaler: Scaler for inverse transformation
+    
+    Returns:
+        Trained DetailedBitcoinPredictor model
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Get input size from first batch
+    for batch_X, batch_y in train_loader:
+        input_size = batch_X.shape[2]
+        break
+    
+    # Initialize detailed predictor
+    model = DetailedBitcoinPredictor(
+        input_size=input_size,
+        hidden_size=params.get('hidden_size', 256),
+        num_layers=params.get('num_layers', 3),
+        dropout=params.get('dropout', 0.1),
+        use_layer_norm=params.get('use_layer_norm', True),
+        activation=params.get('activation', 'SiLU')
+    ).to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=params.get('lr', 1e-4), 
+                            weight_decay=params.get('weight_decay', 1e-5))
+    
+    # Training loop
+    best_val_loss = float('inf')
+    epochs = params.get('epochs', 10)
+    
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        train_loss = 0
+        for batch_X, batch_y in train_loader:
+            batch_X = batch_X.to(device)
+            batch_y = batch_y.to(device)
+            
+            optimizer.zero_grad()
+            detailed_pred = model(batch_X)
+            loss = detailed_loss(detailed_pred, batch_y)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                batch_X = batch_X.to(device)
+                batch_y = batch_y.to(device)
+                
+                detailed_pred = model(batch_X)
+                loss = detailed_loss(detailed_pred, batch_y)
+                val_loss += loss.item()
+        
+        avg_train_loss = train_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+        
+        print(f"Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}")
+        
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), os.path.join(save_dir, 'detailed_model.pth'))
+    
+    return model
 
 def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_name=None, scaler=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(save_dir, exist_ok=True)
-    
-    fold_scores = []
     
     # print(f"\n{'='*60}")
     # print(f"TRIAL: {trial_name}")
@@ -607,7 +762,7 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
         print("Error: No valid batches found in train_loader")
         return float('inf')
         
-    # Initialize model
+        # Initialize model
     model = EnhancedBitcoinPredictor(
         input_size=input_size,
         hidden_size=params['hidden_size'],
@@ -648,9 +803,25 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
             
             optimizer.zero_grad()
             
+            # Debug: Check input data
+            if torch.isnan(batch_X).any():
+                print(f"Warning: NaN detected in input features")
+                print(f"  batch_X shape: {batch_X.shape}")
+                print(f"  NaN count: {torch.isnan(batch_X).sum().item()}")
+                continue
+            
             point_pred, interval_pred = model(batch_X)
             
-            # Use challenge loss function with scaler for real price evaluation
+            # Debug: Check model output
+            if torch.isnan(point_pred).any() or torch.isnan(interval_pred).any():
+                print(f"Warning: NaN detected in model predictions")
+                print(f"  point_pred shape: {point_pred.shape}")
+                print(f"  interval_pred shape: {interval_pred.shape}")
+                print(f"  point_pred NaN count: {torch.isnan(point_pred).sum().item()}")
+                print(f"  interval_pred NaN count: {torch.isnan(interval_pred).sum().item()}")
+                continue
+            
+            # Challenge-specific loss with scaler for real price evaluation
             loss = challenge_loss(point_pred, interval_pred, batch_y, scaler)
             
             # Check for NaN loss
@@ -710,9 +881,6 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
             os.makedirs(fold_dir, exist_ok=True)
             torch.save(model.state_dict(), os.path.join(fold_dir, 'model.pth'))
     
-    fold_scores.append(best_val_score)
-    # print(f"Training completed - Best score: {best_val_score:.4f}")
-    
     # Save training history
     fold_dir = os.path.join(save_dir, 'best_model')
     history = {
@@ -723,19 +891,12 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
     with open(os.path.join(fold_dir, 'training_history.json'), 'w') as f:
         json.dump(history, f, indent=2)
     
-    if len(fold_scores) == 0:
-        print(f"\n{'='*60}")
-        print(f"TRIAL FAILED: {trial_name}")
-        print(f"No successful folds completed")
-        print(f"{'='*60}\n")
-        return float('inf')
-    
-    mean_score = np.mean(fold_scores)
-    std_score = np.std(fold_scores)
+    mean_score = np.mean(val_scores)
+    std_score = np.std(val_scores)
     print(f"\n{'='*60}")
     print(f"TRIAL COMPLETED: {trial_name}")
     print(f"Mean CV Score: {mean_score:.4f} ± {std_score:.4f}")
-    print(f"Individual fold scores: {[f'{score:.4f}' for score in fold_scores]}")
+    print(f"Individual fold scores: {[f'{score:.4f}' for score in val_scores]}")
     print(f"{'='*60}\n")
     
     return mean_score
@@ -744,7 +905,6 @@ def evaluate(model, data_loader, device, scaler=None):
     """
     Comprehensive evaluation system that exactly matches the precog subnet scoring system from reward.py.
     
-    Targets structure: [exact_price_1h_ahead, min_price_1h_period, max_price_1h_period, price_1, price_2, ..., price_12]
     """
     model.eval()
     total_loss = 0
@@ -757,7 +917,17 @@ def evaluate(model, data_loader, device, scaler=None):
             batch_X = batch_X.to(device)
             batch_y = batch_y.to(device)
             
+            # Debug: Check input data in evaluation
+            if torch.isnan(batch_X).any():
+                print(f"Warning: NaN detected in evaluation input features")
+                continue
+            
             point_pred, interval_pred = model(batch_X)
+            
+            # Debug: Check model output in evaluation
+            if torch.isnan(point_pred).any() or torch.isnan(interval_pred).any():
+                print(f"Warning: NaN detected in evaluation model predictions")
+                continue
             
             # Challenge-specific loss with scaler for real price evaluation
             loss = challenge_loss(point_pred, interval_pred, batch_y, scaler)
@@ -791,7 +961,9 @@ def evaluate(model, data_loader, device, scaler=None):
     exact_price_target = all_targets[:, 0]  # Price at exactly 1 hour ahead
     min_price_target = all_targets[:, 1]    # Minimum price during the 1-hour period
     max_price_target = all_targets[:, 2]    # Maximum price during the 1-hour period
-    hour_prices = all_targets[:, 3:]        # All price points within the hour
+    
+    # Extract close prices for each 5-min interval in the hour
+    hour_prices = all_targets[:, 0::3]  # Take every 3rd value starting at index 3 to get close prices
     
     # Basic data validation
     print(f"  DATA VALIDATION:")
@@ -849,19 +1021,12 @@ def evaluate(model, data_loader, device, scaler=None):
     print(f"    Average inclusion factor: {inclusion_factor.mean().item():.4f}")
     print(f"    Average interval score: {avg_interval_score:.4f}")
     
-    # 4. Precog subnet score calculation (matches reward.py)
-    # Point error ranking (lower is better)
     point_error = avg_point_error
-    # Interval score (higher is better, but we want to minimize loss)
     interval_score = avg_interval_score
     
-    # Combined score (lower is better for optimization)
-    # This matches the reward calculation: rewards = (point_weights + interval_weights) / 2
-    # But since we're minimizing loss, we use: loss = 0.5 * point_error + 0.5 * (1.0 - interval_score)
     subnet_score = 0.5 * point_error + 0.5 * (1.0 - interval_score)
     print(f"  PRECOG SUBNET SCORE: {subnet_score:.4f}")
     
-    # 5. Issue Detection
     issues = []
     if avg_point_error > 0.5:
         issues.append("High point error - predictions are poor")
@@ -985,7 +1150,7 @@ class ContinuousLearner:
             point_pred, interval_pred = self.model(val_X)
             
             # Calculate metrics
-            loss = challenge_loss(point_pred, interval_pred, val_y)
+            loss = challenge_loss(point_pred, interval_pred, val_y, self.scaler)
             
         self.model.train()
     
