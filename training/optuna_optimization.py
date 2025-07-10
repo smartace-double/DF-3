@@ -20,7 +20,7 @@ from datetime import datetime
 import warnings
 
 # Import our framework components
-from .cross_validation import CrossValidator, run_cross_validation
+from .cross_validation import WalkForwardCrossValidator, run_walk_forward_cv
 from predictors import create_predictor_from_config
 from losses import precog_loss, synth_loss
 from preprocessing import BitcoinPreprocessor
@@ -334,7 +334,7 @@ class OptunaOptimizer:
                 print(f"  Scheduler: {config['scheduler']}")
             
             # Run cross-validation
-            cv_results = run_cross_validation(
+            cv_results = run_walk_forward_cv(
                 config=config,
                 n_folds=self.n_cv_folds,
                 save_models=False,  # Don't save models during optimization

@@ -91,13 +91,41 @@ class LSTMBitcoinPredictor(BaseBitcoinPredictor):
         Forward pass through the LSTM predictor.
         
         Args:
-            x: Input tensor of shape [batch_size, sequence_length, input_size]
+            x: Input tensor of shape [batch_size, flattened_features] or [batch_size, sequence_length, input_size]
             
         Returns:
             Model predictions based on mode:
             - precog mode: (point_pred, interval_pred)
             - synth mode: (detailed_pred,)
         """
+        # Handle flattened input by reshaping to sequence format
+        if x.dim() == 2:
+            # For flattened input, we need to reshape to [batch_size, sequence_length, features_per_timestep]
+            total_features = x.shape[1]
+            
+            # Get the expected input size from the LSTM layer
+            lstm_input_size = self.feature_encoder.input_size
+            
+            # Calculate lookback from config or infer from dimensions
+            lookback = self.config.get('lookback', 12)
+            
+            # Simple approach: divide total features by lookback to get features per timestep
+            if total_features % lookback == 0:
+                features_per_timestep = total_features // lookback
+                x = x.view(-1, lookback, features_per_timestep)
+            else:
+                # If doesn't divide evenly, use the LSTM's expected input size
+                # and take the first lookback * lstm_input_size features
+                expected_total = lookback * lstm_input_size
+                if total_features >= expected_total:
+                    x_trimmed = x[:, :expected_total]
+                    x = x_trimmed.view(-1, lookback, lstm_input_size)
+                else:
+                    # If not enough features, pad with zeros
+                    padding_needed = expected_total - total_features
+                    x_padded = torch.cat([x, torch.zeros(x.shape[0], padding_needed, device=x.device)], dim=1)
+                    x = x_padded.view(-1, lookback, lstm_input_size)
+        
         # Encode features with LSTM
         encoded, _ = self.feature_encoder(x)
         

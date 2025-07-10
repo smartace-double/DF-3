@@ -509,14 +509,14 @@ class BitcoinPreprocessor:
         sequences_X = []
         sequences_y = []
         
-        # Prepare per-timestep feature data
-        per_timestep_data = df[self.per_timestep_features].values
+        # Prepare per-timestep feature data - ensure numpy arrays
+        per_timestep_data = np.array(df[self.per_timestep_features].values, dtype=np.float32)
         
-        # Prepare static feature data
-        static_data = df[self.static_features].values
+        # Prepare static feature data - ensure numpy arrays
+        static_data = np.array(df[self.static_features].values, dtype=np.float32)
         
-        # Prepare target data
-        target_data = df[self.target_columns].values
+        # Prepare target data - ensure numpy arrays
+        target_data = np.array(df[self.target_columns].values, dtype=np.float32)
         
         # Create sequences
         for i in range(self.lookback, len(df)):
@@ -529,15 +529,15 @@ class BitcoinPreprocessor:
             # Combine features
             # Flatten per-timestep features and concatenate with static features
             seq_combined = np.concatenate([
-                seq_per_timestep.flatten(),  # Flatten to 1D
-                seq_static
+                seq_per_timestep.ravel(),  # Use ravel() to flatten to 1D
+                seq_static.ravel()  # Ensure static features are also flattened
             ])
             
             sequences_X.append(seq_combined)
             sequences_y.append(target_data[i])
         
-        X = np.array(sequences_X)
-        y = np.array(sequences_y)
+        X = np.array(sequences_X, dtype=np.float32)
+        y = np.array(sequences_y, dtype=np.float32)
         
         print(f"Sequences created:")
         print(f"  X shape: {X.shape}")
@@ -618,7 +618,9 @@ class BitcoinPreprocessor:
         if not self.scaler_fitted:
             raise ValueError("Scaler not fitted. Call fit_scaler() first.")
         
-        return self.scaler.transform(X)
+        # Ensure we return a numpy array
+        transformed = self.scaler.transform(X)
+        return np.array(transformed, dtype=np.float32)
     
     def save_preprocessing_artifacts(self, save_dir: str):
         """

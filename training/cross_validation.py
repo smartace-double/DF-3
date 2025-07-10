@@ -426,7 +426,7 @@ class WalkForwardCrossValidator:
                     train_loss += loss.item()
                     train_batches += 1
                 
-                if self.verbose and hasattr(train_pbar, 'set_postfix'):
+                if self.verbose and isinstance(train_pbar, tqdm):
                     train_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
             
             # Validation phase
@@ -481,16 +481,18 @@ class WalkForwardCrossValidator:
         
         return best_score, final_metrics
     
-    def _calculate_loss(self, predictions: Tuple[torch.Tensor, ...], targets: torch.Tensor) -> torch.Tensor:
+    def _calculate_loss(self, predictions, targets: torch.Tensor) -> torch.Tensor:
         """Calculate loss based on model mode."""
         if self.config['mode'] == 'precog':
             # For precog mode: predictions should be (point_pred, interval_pred)
             if isinstance(predictions, tuple) and len(predictions) >= 2:
                 point_pred, interval_pred = predictions[0], predictions[1]
             else:
-                # If not tuple, split the predictions
-                point_pred = predictions[..., :targets.shape[1]//3]  # First third
-                interval_pred = predictions[..., targets.shape[1]//3:]  # Rest for intervals
+                # If not tuple, split the predictions using torch operations
+                pred_tensor = predictions if torch.is_tensor(predictions) else predictions[0]
+                third_size = targets.shape[1] // 3
+                point_pred = pred_tensor.narrow(1, 0, third_size)  # First third
+                interval_pred = pred_tensor.narrow(1, third_size, targets.shape[1] - third_size)  # Rest for intervals
             return precog_loss(point_pred, interval_pred, targets, None)  # No scaler for relative returns
         elif self.config['mode'] == 'synth':
             # For synth mode: detailed predictions
@@ -498,7 +500,8 @@ class WalkForwardCrossValidator:
             return synth_loss(detailed_pred, targets, None)  # No scaler for relative returns
         else:
             # Default MSE loss for relative returns
-            return nn.MSELoss()(predictions, targets)
+            pred_tensor = predictions[0] if isinstance(predictions, tuple) else predictions
+            return nn.MSELoss()(pred_tensor, targets)
     
     def _evaluate_fold(self, model: nn.Module, val_loader: DataLoader) -> float:
         """Quick evaluation for a fold (returns single score)."""
@@ -613,13 +616,13 @@ class WalkForwardCrossValidator:
         
         # Calculate summary statistics
         if len(fold_scores) > 0:
-            mean_score = np.mean(fold_scores)
-            std_score = np.std(fold_scores)
-            best_fold = np.argmin(fold_scores)
-            best_score = fold_scores[best_fold]
+            mean_score = float(np.mean(fold_scores))
+            std_score = float(np.std(fold_scores))
+            best_fold = int(np.argmin(fold_scores))
+            best_score = float(fold_scores[best_fold])
         else:
             mean_score = float('inf')
-            std_score = 0
+            std_score = 0.0
             best_fold = -1
             best_score = float('inf')
         
