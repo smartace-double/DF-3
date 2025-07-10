@@ -835,7 +835,7 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
     )
     
     # Mixed precision training for better GPU efficiency
-    scaler = GradScaler() if torch.cuda.is_available() else None
+    grad_scaler = GradScaler() if torch.cuda.is_available() else None
     
     # Training loop
     best_val_score = float('inf')
@@ -876,7 +876,7 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
                 continue
             
             # Mixed precision training
-            if scaler is not None:
+            if grad_scaler is not None:
                 with autocast():
                     point_pred, interval_pred = model(batch_X)
                     
@@ -903,11 +903,11 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
                         continue
                 
                 # Scale loss and backward pass
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                grad_scaler.scale(loss).backward()
+                grad_scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), params.get('grad_clip', 1.0))
-                scaler.step(optimizer)
-                scaler.update()
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
             else:
                 point_pred, interval_pred = model(batch_X)
                 
