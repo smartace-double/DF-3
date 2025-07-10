@@ -27,7 +27,7 @@ def test_optimized_training():
     
     # Load a small subset of data for testing
     print("\nLoading dataset...")
-    dataset = BTCDataset(dataset_path='datasets/structured_dataset.csv')
+    dataset = BTCDataset(dataset_path='datasets/complete_dataset_20250709_152829.csv')
     train_loader, val_loader, test_loader = dataset.load_dataset()
     
     print(f"DataLoaders created:")

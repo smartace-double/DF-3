@@ -1,0 +1,93 @@
+# LSTM Bitcoin Price Predictor Configuration - Synth Mode
+# This configuration is for detailed predictions of close, low, high at each timestep
+# Provides full temporal resolution for analysis and research
+
+# Model Configuration
+model_type: LSTM
+mode: synth
+
+# Model Architecture
+hidden_size: 512     # Larger hidden size for detailed predictions
+num_layers: 4        # More layers for complex temporal patterns
+dropout: 0.15        # Slightly higher dropout for regularization
+activation: SiLU
+use_layer_norm: true
+bidirectional: false
+
+# Training Configuration
+lr: 0.0001
+batch_size: 256      # Smaller batch size due to larger model
+epochs: 15           # More epochs for detailed learning
+weight_decay: 0.00001
+grad_clip: 1.0
+patience: 7          # More patience for detailed mode
+
+# Data Configuration
+dataset_path: datasets/complete_dataset_20250709_152829.csv
+lookback: 72         # 6 hours * 12 (5-minute intervals)
+horizon: 12          # 1 hour * 12 (5-minute intervals)
+train_split: 0.85
+val_split: 0.10
+test_split: 0.05
+
+# System Configuration
+save_dir: models
+use_gpu: true
+mixed_precision: true
+num_workers: 4
+pin_memory: true
+persistent_workers: true
+
+# Optuna Hyperparameter Optimization Configuration
+optuna:
+  # Study Configuration
+  study_name: lstm_synth_optimization
+  n_trials: 100
+  timeout: 86400  # 24 hours in seconds
+  n_cv_folds: 5
+  
+  # Architecture Search Space
+  architecture:
+    hidden_size: [128, 256, 512, 1024]  # Larger for synth mode
+    num_layers: [2, 3, 4, 5]
+    dropout: [0.0, 0.5]
+    bidirectional: [true, false]
+    use_layer_norm: [true, false]
+    activation: [SiLU, GELU, ReLU, Tanh]
+  
+  # Training Search Space
+  training:
+    epochs: [15, 150]  # More epochs for synth mode
+    batch_size: [256, 512, 1024, 2048]
+    grad_clip: [0.1, 2.0]
+    patience: [8, 25]  # More patience for synth mode
+    mixed_precision: [true, false]
+  
+  # Optimizer Search Space
+  optimizer:
+    type: [AdamW, Adam, RMSprop, SGD]
+    lr: [1e-5, 1e-2]  # log scale
+    weight_decay: [1e-6, 1e-3]  # log scale
+    beta1: [0.8, 0.99]  # for Adam/AdamW
+    beta2: [0.9, 0.999]  # for Adam/AdamW
+    eps: [1e-8, 1e-6]  # log scale
+    momentum: [0.0, 0.9]  # for SGD/RMSprop
+  
+  # Scheduler Search Space
+  scheduler:
+    type: [OneCycleLR, CosineAnnealingLR, ReduceLROnPlateau, StepLR, None]
+    pct_start: [0.1, 0.5]  # OneCycleLR
+    div_factor: [10.0, 100.0]  # OneCycleLR
+    final_div_factor: [100.0, 10000.0]  # OneCycleLR
+    T_max: [10, 100]  # CosineAnnealingLR
+    eta_min: [1e-6, 1e-4]  # CosineAnnealingLR, log scale
+    factor: [0.1, 0.8]  # ReduceLROnPlateau
+    step_size: [10, 50]  # StepLR
+    gamma: [0.1, 0.9]  # StepLR
+  
+  # Preprocessing Search Space
+  preprocessing:
+    scaler_type: [standard, robust, minmax]
+    lookback: [48, 72, 96, 120]
+    handle_outliers: [true, false]
+    add_technical_features: [true, false] 

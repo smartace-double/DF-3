@@ -1,0 +1,69 @@
+# LightGBM Bitcoin Price Predictor Configuration - Precog Mode
+# This configuration is optimized for the precog subnet challenge format
+# Uses gradient boosting for point and interval predictions
+
+# Model Configuration
+model_type: LightGBM
+mode: precog
+
+# LightGBM Model Parameters
+num_leaves: 31
+learning_rate: 0.1
+feature_fraction: 0.9
+bagging_fraction: 0.8
+bagging_freq: 5
+min_child_samples: 20
+max_depth: -1
+reg_alpha: 0.0
+reg_lambda: 0.0
+random_state: 42
+n_jobs: -1
+
+# Training Configuration
+num_boost_round: 1000
+early_stopping_rounds: 100
+
+# Data Configuration
+dataset_path: datasets/complete_dataset_20250709_152829.csv
+lookback: 72        # 6 hours * 12 (5-minute intervals)
+horizon: 12         # 1 hour * 12 (5-minute intervals)
+train_split: 0.85
+val_split: 0.10
+test_split: 0.05
+
+# System Configuration
+save_dir: models
+use_gpu: false  # LightGBM can use GPU but typically runs well on CPU
+num_workers: 4
+
+# Optuna Hyperparameter Optimization Configuration
+optuna:
+  # Study Configuration
+  study_name: lightgbm_precog_optimization
+  n_trials: 150
+  timeout: 43200  # 12 hours in seconds
+  n_cv_folds: 5
+  
+  # LightGBM Architecture Search Space
+  architecture:
+    num_leaves: [10, 300]
+    learning_rate: [0.01, 0.3]
+    feature_fraction: [0.4, 1.0]
+    bagging_fraction: [0.4, 1.0]
+    bagging_freq: [1, 7]
+    min_child_samples: [5, 100]
+    max_depth: [3, 12]
+    reg_alpha: [0.0, 1.0]
+    reg_lambda: [0.0, 1.0]
+  
+  # Training Search Space
+  training:
+    num_boost_round: [500, 2000]
+    early_stopping_rounds: [50, 200]
+  
+  # Preprocessing Search Space
+  preprocessing:
+    scaler_type: [standard, robust, minmax]
+    lookback: [48, 72, 96, 120]
+    handle_outliers: [true, false]
+    add_technical_features: [true, false] 

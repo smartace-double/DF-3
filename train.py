@@ -701,7 +701,7 @@ def main():
     """Main training pipeline."""
     try:
         # Load data
-        df = load_data("datasets/structured_dataset.csv")
+        df = load_data("datasets/complete_dataset_20250709_152829.csv")
         
         # Handle missing values
         df = handle_missing_values(df)

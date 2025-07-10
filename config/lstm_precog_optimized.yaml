@@ -1,0 +1,39 @@
+# LSTM Bitcoin Price Predictor Configuration - Precog Mode (Optimized)
+# This configuration is optimized for maximum performance in the precog subnet challenge
+# Uses larger model and more sophisticated training settings
+
+# Model Configuration
+model_type: LSTM
+mode: precog
+
+# Model Architecture
+hidden_size: 384     # Larger hidden size for better representation
+num_layers: 4        # More layers for complex patterns
+dropout: 0.1
+activation: SiLU
+use_layer_norm: true
+bidirectional: true  # Bidirectional for better context
+
+# Training Configuration
+lr: 0.0001
+batch_size: 1024     # Larger batch size for stable training
+epochs: 20           # More epochs for convergence
+weight_decay: 0.00001
+grad_clip: 1.0
+patience: 8          # More patience for optimal performance
+
+# Data Configuration
+dataset_path: datasets/complete_dataset_20250709_152829.csv
+lookback: 144        # 12 hours * 12 (5-minute intervals) - longer context
+horizon: 12          # 1 hour * 12 (5-minute intervals)
+train_split: 0.85
+val_split: 0.10
+test_split: 0.05
+
+# System Configuration
+save_dir: models
+use_gpu: true
+mixed_precision: true
+num_workers: 8       # More workers for faster data loading
+pin_memory: true
+persistent_workers: true 

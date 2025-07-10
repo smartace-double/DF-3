@@ -155,7 +155,7 @@ def run_optimization(train_loader, val_loader, scaler=None):
     return study
 
 class BTCDataset:
-    def __init__(self, dataset_path='datasets/structured_dataset.csv', lookback=6*12, horizon=12):
+    def __init__(self, dataset_path='datasets/complete_dataset_20250709_152829.csv', lookback=6*12, horizon=12):
         self.dataset_path = dataset_path
         self.lookback = lookback
         self.horizon = horizon  # 12 steps = 1 hour (5-minute intervals)
@@ -171,13 +171,6 @@ class BTCDataset:
 
         bias = 15000
         df = df.iloc[bias:]
-        
-        # Debug: Check data time range
-        # print(f"DEBUG: Dataset time range:")
-        # print(f"  Start: {df['timestamp'].min()}")
-        # print(f"  End: {df['timestamp'].max()}")
-        # print(f"  Total rows: {len(df)}")
-        # print(f"  Close price range: [{df['close'].min():.2f}, {df['close'].max():.2f}]")
         
         # 1. Clean the data first
         print(f"Cleaning data...")
@@ -201,22 +194,16 @@ class BTCDataset:
         print(f"Fitting scaler on training data...")
         self.fit_scaler(train_df)
         # apply scaler transform to train, val and test data
-        transformed_train_df = self.transform_data(train_df, self.scaler)
-        transformed_val_df = self.transform_data(val_df, self.scaler)
-        transformed_test_df = self.transform_data(test_df, self.scaler)
-        
-        
-        # 5. Fit scaler on training data only (excluding target columns)
-        
-        # 6. Transform all datasets (excluding target columns)
+        self.transformed_train_df = self.transform_data(train_df, self.scaler)
+        self.transformed_val_df = self.transform_data(val_df, self.scaler)
+        self.transformed_test_df = self.transform_data(test_df, self.scaler)
         
         # 7. Create DataLoaders directly (memory efficient)
         print(f"Creating DataLoaders...")
-        # Use fixed optimal batch size
         batch_size = 512
-        train_loader = self.create_dataloader(transformed_train_df, batch_size=batch_size, shuffle=False)
-        val_loader = self.create_dataloader(transformed_val_df, batch_size=batch_size, shuffle=False)
-        test_loader = self.create_dataloader(transformed_test_df, batch_size=batch_size, shuffle=False)
+        train_loader = self.create_dataloader(self.transformed_train_df, batch_size=batch_size, shuffle=False)
+        val_loader = self.create_dataloader(self.transformed_val_df, batch_size=batch_size, shuffle=False)
+        test_loader = self.create_dataloader(self.transformed_test_df, batch_size=batch_size, shuffle=False)
         
         print(f"DataLoaders created successfully")
         print(f"  Train batches: {len(train_loader)}")
@@ -1332,7 +1319,7 @@ if __name__ == "__main__":
     
     # Load dataset ONCE with proper train/val/test split
     print("Loading dataset...")
-    dataset = BTCDataset(dataset_path='datasets/structured_dataset.csv')
+    dataset = BTCDataset(dataset_path='datasets/complete_dataset_20250709_152829.csv')
     train_loader, val_loader, test_loader = dataset.load_dataset()
     
     print(f"DataLoaders created successfully")

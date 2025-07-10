@@ -1,0 +1,270 @@
+# TFT Predictor Configuration - Precog Mode
+# Temporal Fusion Transformer for Bitcoin price prediction (point + interval predictions)
+
+model:
+  name: "TFT"
+  prediction_mode: "precog"
+  
+  # Architecture parameters
+  input_size: 20  # Will be determined automatically based on preprocessed features
+  hidden_size: 128
+  num_heads: 8
+  num_layers: 3
+  dropout: 0.1
+  use_layer_norm: true
+  
+  # Quantile regression parameters
+  quantiles: [0.1, 0.25, 0.5, 0.75, 0.9]
+  
+  # TFT-specific parameters
+  variable_selection: true
+  attention_mechanism: "multi_head"
+  gating_mechanism: "glu"
+  
+  # Uncertainty quantification
+  uncertainty_method: "quantile"  # Options: "quantile", "gaussian", "monte_carlo"
+  monte_carlo_samples: 10
+
+data:
+  # Time series parameters
+  lookback_window: 72  # 6 hours (5-minute intervals)
+  prediction_horizon: 12  # 1 hour (5-minute intervals)
+  
+  # Feature engineering
+  use_technical_indicators: true
+  use_temporal_features: true
+  use_whale_features: true
+  
+  # Data preprocessing
+  scaling_method: "standard"  # Options: "standard", "robust", "minmax"
+  handle_outliers: true
+  outlier_method: "iqr"
+  
+  # Data splits
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  
+  # Time series split
+  time_series_split: true
+  cv_folds: 5
+
+training:
+  # Basic training parameters
+  batch_size: 256
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  
+  # Optimizer settings
+  optimizer: "adamw"
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  amsgrad: false
+  
+  # Scheduler settings
+  scheduler: "onecycle"
+  max_lr: 0.01
+  pct_start: 0.3
+  div_factor: 25
+  final_div_factor: 10000
+  
+  # Regularization
+  gradient_clipping: 1.0
+  early_stopping:
+    patience: 15
+    min_delta: 0.0001
+    restore_best_weights: true
+  
+  # Mixed precision training
+  mixed_precision: true
+  gradient_accumulation_steps: 1
+  
+  # Checkpointing
+  save_best_model: true
+  save_last_model: true
+  checkpoint_every: 10
+
+# Optuna hyperparameter optimization
+optuna:
+  # Study configuration
+  study_name: "tft_precog_optimization"
+  direction: "minimize"
+  n_trials: 100
+  timeout: 86400  # 24 hours
+  
+  # Pruning and sampling
+  pruner: "hyperband"
+  sampler: "tpe"
+  n_startup_trials: 10
+  n_warmup_steps: 5
+  
+  # Hyperparameter search spaces
+  search_spaces:
+    # Architecture parameters
+    hidden_size:
+      type: "categorical"
+      choices: [64, 128, 256]
+    
+    num_heads:
+      type: "categorical"
+      choices: [4, 8, 16]
+    
+    num_layers:
+      type: "int"
+      low: 2
+      high: 4
+    
+    dropout:
+      type: "float"
+      low: 0.0
+      high: 0.3
+      step: 0.05
+    
+    # Training parameters
+    learning_rate:
+      type: "float"
+      low: 1e-5
+      high: 1e-2
+      log: true
+    
+    weight_decay:
+      type: "float"
+      low: 1e-6
+      high: 1e-3
+      log: true
+    
+    batch_size:
+      type: "categorical"
+      choices: [128, 256, 512]
+    
+    gradient_clipping:
+      type: "float"
+      low: 0.1
+      high: 2.0
+      step: 0.1
+    
+    # Optimizer parameters
+    optimizer:
+      type: "categorical"
+      choices: ["adam", "adamw", "rmsprop", "sgd"]
+    
+    # Scheduler parameters
+    scheduler:
+      type: "categorical"
+      choices: ["onecycle", "cosine", "step", "plateau"]
+    
+    # TFT-specific parameters
+    quantiles:
+      type: "categorical"
+      choices: [
+        [0.1, 0.5, 0.9],
+        [0.1, 0.25, 0.5, 0.75, 0.9],
+        [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+      ]
+    
+    uncertainty_method:
+      type: "categorical"
+      choices: ["quantile", "gaussian", "monte_carlo"]
+    
+    # Data preprocessing parameters
+    lookback_window:
+      type: "int"
+      low: 48
+      high: 144
+      step: 12
+    
+    scaling_method:
+      type: "categorical"
+      choices: ["standard", "robust", "minmax"]
+
+# Loss function configuration
+loss:
+  # Precog-specific loss components
+  point_loss_weight: 0.5
+  interval_loss_weight: 0.5
+  
+  # Quantile loss parameters
+  quantile_loss_weight: 0.2
+  huber_delta: 1.0
+  
+  # Regularization losses
+  l1_regularization: 0.0
+  l2_regularization: 0.0
+  
+  # TFT-specific losses
+  attention_entropy_weight: 0.01
+  variable_selection_sparsity: 0.01
+
+# Evaluation metrics
+metrics:
+  # Point prediction metrics
+  - "mae"
+  - "mse"
+  - "rmse"
+  - "mape"
+  - "smape"
+  
+  # Interval prediction metrics
+  - "interval_coverage"
+  - "interval_width"
+  - "interval_score"
+  
+  # Quantile metrics
+  - "quantile_loss"
+  - "coverage_probability"
+  - "width_score"
+  
+  # TFT-specific metrics
+  - "attention_entropy"
+  - "variable_importance"
+
+# Model saving and loading
+model_save:
+  save_dir: "./models/tft_precog"
+  save_format: "pytorch"
+  save_optimizer_state: true
+  save_scheduler_state: true
+  versioning: true
+
+# Logging and monitoring
+logging:
+  level: "INFO"
+  log_dir: "./logs/tft_precog"
+  tensorboard: true
+  wandb: false
+  
+  # What to log
+  log_model_architecture: true
+  log_gradients: true
+  log_weights: true
+  log_attention_weights: true
+  log_variable_importance: true
+  
+  # Logging frequency
+  log_every_n_steps: 100
+  validate_every_n_epochs: 1
+  
+# Hardware and performance
+hardware:
+  device: "auto"  # "auto", "cpu", "cuda", "mps"
+  mixed_precision: true
+  compile_model: false  # PyTorch 2.0 compilation
+  
+  # Multi-GPU settings
+  data_parallel: false
+  distributed_training: false
+  
+  # Memory optimization
+  gradient_checkpointing: false
+  memory_efficient_attention: true
+  
+# Random seed for reproducibility
+seed: 42
+
+# Debugging and development
+debug:
+  enabled: false
+  profile_training: false
+  check_numerical_stability: false
+  validate_input_output: false 

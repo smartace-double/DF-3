@@ -1,0 +1,265 @@
+# TCN Predictor Configuration - Synth Mode
+# Temporal Convolutional Network for Bitcoin price prediction (detailed timestep predictions)
+
+model:
+  name: "TCN"
+  prediction_mode: "synth"
+  
+  # Architecture parameters
+  input_size: 20  # Will be determined automatically based on preprocessed features
+  num_channels: [64, 128, 256]  # Channel dimensions for each TCN layer
+  kernel_size: 3
+  dropout: 0.2
+  
+  # TCN-specific parameters
+  pooling_method: "attention"  # Options: "last", "mean", "max", "attention", "adaptive"
+  use_weight_norm: true
+  use_residual_connections: true
+  
+  # Uncertainty quantification
+  uncertainty_method: "heteroscedastic"  # Options: "heteroscedastic", "monte_carlo"
+  monte_carlo_samples: 10
+
+data:
+  # Time series parameters
+  lookback_window: 72  # 6 hours (5-minute intervals)
+  prediction_horizon: 12  # 1 hour (5-minute intervals)
+  
+  # Feature engineering
+  use_technical_indicators: true
+  use_temporal_features: true
+  use_whale_features: true
+  
+  # Data preprocessing
+  scaling_method: "standard"  # Options: "standard", "robust", "minmax"
+  handle_outliers: true
+  outlier_method: "iqr"
+  
+  # Data splits
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  
+  # Time series split
+  time_series_split: true
+  cv_folds: 5
+
+training:
+  # Basic training parameters
+  batch_size: 256
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  
+  # Optimizer settings
+  optimizer: "adamw"
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  amsgrad: false
+  
+  # Scheduler settings
+  scheduler: "onecycle"
+  max_lr: 0.01
+  pct_start: 0.3
+  div_factor: 25
+  final_div_factor: 10000
+  
+  # Regularization
+  gradient_clipping: 1.0
+  early_stopping:
+    patience: 15
+    min_delta: 0.0001
+    restore_best_weights: true
+  
+  # Mixed precision training
+  mixed_precision: true
+  gradient_accumulation_steps: 1
+  
+  # Checkpointing
+  save_best_model: true
+  save_last_model: true
+  checkpoint_every: 10
+
+# Optuna hyperparameter optimization
+optuna:
+  # Study configuration
+  study_name: "tcn_synth_optimization"
+  direction: "minimize"
+  n_trials: 100
+  timeout: 86400  # 24 hours
+  
+  # Pruning and sampling
+  pruner: "hyperband"
+  sampler: "tpe"
+  n_startup_trials: 10
+  n_warmup_steps: 5
+  
+  # Hyperparameter search spaces
+  search_spaces:
+    # Architecture parameters
+    num_channels:
+      type: "categorical"
+      choices: [
+        [32, 64, 128],
+        [64, 128, 256],
+        [128, 256, 512],
+        [64, 128, 256, 512]
+      ]
+    
+    kernel_size:
+      type: "categorical"
+      choices: [2, 3, 5, 7]
+    
+    dropout:
+      type: "float"
+      low: 0.0
+      high: 0.5
+      step: 0.05
+    
+    # Training parameters
+    learning_rate:
+      type: "float"
+      low: 1e-5
+      high: 1e-2
+      log: true
+    
+    weight_decay:
+      type: "float"
+      low: 1e-6
+      high: 1e-3
+      log: true
+    
+    batch_size:
+      type: "categorical"
+      choices: [128, 256, 512]
+    
+    gradient_clipping:
+      type: "float"
+      low: 0.1
+      high: 2.0
+      step: 0.1
+    
+    # Optimizer parameters
+    optimizer:
+      type: "categorical"
+      choices: ["adam", "adamw", "rmsprop", "sgd"]
+    
+    # Scheduler parameters
+    scheduler:
+      type: "categorical"
+      choices: ["onecycle", "cosine", "step", "plateau"]
+    
+    # TCN-specific parameters
+    pooling_method:
+      type: "categorical"
+      choices: ["last", "mean", "max", "attention", "adaptive"]
+    
+    # Data preprocessing parameters
+    lookback_window:
+      type: "int"
+      low: 48
+      high: 144
+      step: 12
+    
+    scaling_method:
+      type: "categorical"
+      choices: ["standard", "robust", "minmax"]
+
+# Loss function configuration
+loss:
+  # Synth-specific loss components
+  base_loss_weight: 0.6
+  consistency_loss_weight: 0.2
+  temporal_smoothness_weight: 0.1
+  boundary_loss_weight: 0.1
+  
+  # Uncertainty loss parameters
+  uncertainty_loss_weight: 0.01
+  heteroscedastic_weight: 0.1
+  
+  # Regularization losses
+  l1_regularization: 0.0
+  l2_regularization: 0.0
+  
+  # TCN-specific losses
+  receptive_field_penalty: 0.0
+  temporal_consistency_weight: 0.01
+  
+  # Synth-specific parameters
+  consistency_epsilon: 1e-3
+  smoothness_lambda: 0.1
+  boundary_margin: 0.01
+
+# Evaluation metrics
+metrics:
+  # Detailed prediction metrics
+  - "mae"
+  - "mse"
+  - "rmse"
+  - "mape"
+  - "smape"
+  
+  # Synth-specific metrics
+  - "consistency_score"
+  - "temporal_smoothness"
+  - "boundary_violations"
+  - "sequence_accuracy"
+  
+  # TCN-specific metrics
+  - "receptive_field_size"
+  - "temporal_consistency"
+  - "uncertainty_calibration"
+  
+  # Uncertainty metrics
+  - "heteroscedastic_loss"
+  - "uncertainty_coverage"
+
+# Model saving and loading
+model_save:
+  save_dir: "./models/tcn_synth"
+  save_format: "pytorch"
+  save_optimizer_state: true
+  save_scheduler_state: true
+  versioning: true
+
+# Logging and monitoring
+logging:
+  level: "INFO"
+  log_dir: "./logs/tcn_synth"
+  tensorboard: true
+  wandb: false
+  
+  # What to log
+  log_model_architecture: true
+  log_gradients: true
+  log_weights: true
+  log_receptive_field: true
+  log_temporal_attention: true
+  
+  # Logging frequency
+  log_every_n_steps: 100
+  validate_every_n_epochs: 1
+  
+# Hardware and performance
+hardware:
+  device: "auto"  # "auto", "cpu", "cuda", "mps"
+  mixed_precision: true
+  compile_model: false  # PyTorch 2.0 compilation
+  
+  # Multi-GPU settings
+  data_parallel: false
+  distributed_training: false
+  
+  # Memory optimization
+  gradient_checkpointing: false
+  memory_efficient_attention: true
+  
+# Random seed for reproducibility
+seed: 42
+
+# Debugging and development
+debug:
+  enabled: false
+  profile_training: false
+  check_numerical_stability: false
+  validate_input_output: false 
