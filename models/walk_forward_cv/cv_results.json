@@ -1,0 +1,13 @@
+{
+  "mean_score": Infinity,
+  "std_score": 0.0,
+  "best_fold": -1,
+  "best_score": Infinity,
+  "fold_scores": [],
+  "mode": "precog",
+  "model_type": "LSTM",
+  "n_folds": 0,
+  "total_samples": 670822,
+  "timestamp": "2025-07-10T15:01:27.514812",
+  "cv_type": "walk_forward_expanding_window"
+}

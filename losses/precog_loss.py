@@ -3,10 +3,11 @@ Precog Loss Functions
 
 This module contains loss and evaluation functions specific to the precog challenge mode.
 The precog challenge predicts:
-1. Point prediction: Exact BTC price 1 hour ahead
-2. Interval prediction: [min, max] range for the entire 1-hour period
+1. Point prediction: Exact BTC price in USD 1 hour ahead  
+2. Interval prediction: [min, max] USD price range for the entire 1-hour period
 
-These functions exactly match the precog subnet scoring system.
+The model predicts relative returns (trained on relative return targets), but these must be
+converted to USD prices for loss calculation to match the challenge requirements.
 """
 
 import torch
@@ -15,27 +16,26 @@ import numpy as np
 from typing import Optional, Tuple, Dict, Any
 from tqdm import tqdm
 
-EPSILON = 1e-4
+EPSILON = 1e-8
 
 def precog_loss(point_pred: torch.Tensor, 
                 interval_pred: torch.Tensor, 
                 targets: torch.Tensor, 
-                scaler: Optional[Any] = None) -> torch.Tensor:
+                scaler: Optional[Any] = None,
+                current_prices: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    Loss function that exactly matches the precog subnet scoring system.
+    Loss function for precog challenge converting relative returns to USD prices.
     
     Args:
-        point_pred: Point predictions [batch_size]
-        interval_pred: Interval predictions [batch_size, 2] (min, max)
-        targets: Target tensor [batch_size, 36] with detailed predictions
-        scaler: Optional scaler for inverse transformation
+        point_pred: Point predictions [batch_size] (relative returns from model)
+        interval_pred: Interval predictions [batch_size, 2] (relative returns from model)
+        targets: Target tensor [batch_size, 36] with relative return targets
+        scaler: Scaler for extracting current price reference
+        current_prices: Optional tensor of current prices [batch_size] for conversion
     
     Returns:
         Combined loss value
     """
-    # Extract targets from the detailed structure
-    # targets has shape [batch_size, 36] where 36 = 12 time steps * 3 values (close, low, high)
-    
     # Debug: Check target shape and values
     if torch.isnan(targets).any():
         print(f"Warning: NaN detected in targets in precog_loss")
@@ -44,54 +44,71 @@ def precog_loss(point_pred: torch.Tensor,
         return torch.tensor(float('inf'), device=point_pred.device)
     
     # Reshape targets to [batch_size, 12, 3] for easier processing
-    targets_reshaped = targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [close, low, high]
+    targets_reshaped = targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [point_return, min_return, max_return]
     
-    # Extract base targets:
-    # 1. Exact price 1 hour ahead = close price at the last time step (index 11)
-    exact_price_target = targets_reshaped[:, 11, 0].clamp(min=EPSILON)  # close at time step 11
+    # Extract relative return targets:
+    # 1. Point return at the last time step (index 11)
+    point_return_target = targets_reshaped[:, 11, 0]  # point return at time step 11
     
-    # 2. Min price during 1-hour period = minimum of all low prices
-    min_price_target = targets_reshaped[:, :, 1].min(dim=1)[0]  # min of all low prices
+    # 2. Min return during 1-hour period = minimum of all min returns
+    min_return_target = targets_reshaped[:, :, 1].min(dim=1)[0]  # min of all min returns
     
-    # 3. Max price during 1-hour period = maximum of all high prices  
-    max_price_target = targets_reshaped[:, :, 2].max(dim=1)[0]  # max of all high prices
+    # 3. Max return during 1-hour period = maximum of all max returns  
+    max_return_target = targets_reshaped[:, :, 2].max(dim=1)[0]  # max of all max returns
     
-    # 4. All close prices for inclusion factor calculation
-    hour_prices = targets_reshaped[:, :, :].view(-1, 36)  # All high, low, close prices [batch_size, 36]
-    # remove duplicated hour prices
-    hour_prices = hour_prices.unique(dim=1)
+    # 4. All point returns for inclusion factor calculation
+    hour_returns = targets_reshaped[:, :, 0]  # All point returns [batch_size, 12]
     
-    # Convert scaled predictions back to original scale for price-related features
-    if scaler is not None:
-        # Cache scaler parameters on GPU to avoid repeated CPU-GPU transfers
-        if not hasattr(precog_loss, '_scaler_cache'):
-            precog_loss._scaler_cache = {
-                'mean': torch.FloatTensor(scaler.mean_).to(point_pred.device),
-                'scale': torch.FloatTensor(scaler.scale_).to(point_pred.device),
-                'price_indices': torch.tensor([3, 1, 2], device=point_pred.device)  # [close, high, low]
-            }
-        
-        cache = precog_loss._scaler_cache
-        mean_ = cache['mean']
-        scale_ = cache['scale']
-        price_indices = cache['price_indices']
-        
-        # Efficient GPU-based inverse transform (vectorized operations)
-        point_pred_unscaled = point_pred * scale_[price_indices[0]] + mean_[price_indices[0]]
-        interval_min_unscaled = interval_pred[:, 0] * scale_[price_indices[1]] + mean_[price_indices[1]]
-        interval_max_unscaled = interval_pred[:, 1] * scale_[price_indices[2]] + mean_[price_indices[2]]
-        
-        # Use unscaled values for calculations
-        point_pred = point_pred_unscaled
-        interval_pred = torch.stack([interval_min_unscaled, interval_max_unscaled], dim=1)
+    # Get current prices for conversion (extract from scaler if not provided)
+    if current_prices is None:
+        if scaler is not None:
+            # The current_close is one of the static features
+            # In the preprocessing, static features are at the end of the feature vector
+            # We need to find the index of 'current_close' in the static features
+            # Based on the preprocessing code, static features are:
+            # ['current_close', 'log_current_close', 'hour_sin', 'hour_cos', 'day_of_week_sin', 'day_of_week_cos']
+            # So current_close is at index 0 of static features
+            
+            # The feature vector structure is: [per_timestep_features_flattened, static_features]
+            # Per-timestep features: 29 features * 12 timesteps = 348 features
+            # Static features: 6 features
+            # Total: 354 features
+            
+            # We need to get the preprocessor's feature structure to find current_close index
+            print("Warning: current_prices not provided and scaler index mapping not implemented yet")
+            print("Using dummy current prices (this will cause incorrect loss calculation)")
+            current_prices = torch.ones(point_pred.shape[0], device=point_pred.device) * 50000.0  # Dummy BTC price
+        else:
+            print("Warning: Neither current_prices nor scaler provided for relative return conversion")
+            print("Using dummy current prices (this will cause incorrect loss calculation)")
+            current_prices = torch.ones(point_pred.shape[0], device=point_pred.device) * 50000.0  # Dummy BTC price
     
-    # 1. Point Prediction Loss (MAPE for exact 1-hour ahead price)
-    point_mape = torch.abs(point_pred - exact_price_target) / exact_price_target.clamp(min=EPSILON)
+    # Convert relative returns to USD prices
+    # USD_price = current_price * (1 + relative_return)
+    
+    # Convert point predictions and targets
+    point_pred_usd = current_prices * (1 + point_pred)
+    point_target_usd = current_prices * (1 + point_return_target)
+    
+    # Convert interval predictions and targets
+    interval_min_pred_usd = current_prices * (1 + interval_pred[:, 0])
+    interval_max_pred_usd = current_prices * (1 + interval_pred[:, 1])
+    min_target_usd = current_prices * (1 + min_return_target)
+    max_target_usd = current_prices * (1 + max_return_target)
+    
+    # Convert all hour returns to USD prices for inclusion factor
+    hour_prices_usd = current_prices.unsqueeze(1) * (1 + hour_returns)  # [batch_size, 12]
+    
+    # Ensure targets are positive for MAPE calculation
+    point_target_usd = point_target_usd.clamp(min=EPSILON)
+    
+    # 1. Point Prediction Loss (MAPE for exact 1-hour ahead USD price)
+    point_mape = torch.abs(point_pred_usd - point_target_usd) / point_target_usd.clamp(min=EPSILON)
     point_loss = point_mape.mean()
 
-    # 2. Interval Loss Components (exactly matching reward.py logic)
-    interval_min = interval_pred[:, 0]
-    interval_max = interval_pred[:, 1]
+    # 2. Interval Loss Components (exactly matching reward.py logic for USD prices)
+    interval_min = interval_min_pred_usd
+    interval_max = interval_max_pred_usd
     
     # Ensure valid intervals (min < max)
     interval_min = torch.minimum(interval_min, interval_max - EPSILON)
@@ -99,32 +116,27 @@ def precog_loss(point_pred: torch.Tensor,
     
     # Calculate width factor (f_w) exactly as in reward.py
     # effective_top = min(pred_max, observed_max)
-    # effective_bottom = max(pred_min, observed_min)
+    # effective_bottom = max(pred_min, observed_min)  
     # width_factor = (effective_top - effective_bottom) / (pred_max - pred_min)
-    effective_top = torch.minimum(interval_max, max_price_target)
-    effective_bottom = torch.maximum(interval_min, min_price_target)
+    effective_top = torch.minimum(interval_max, max_target_usd)
+    effective_bottom = torch.maximum(interval_min, min_target_usd)
     
-    # Handle case where pred_max == pred_min (invalid interval) with better numerical stability
+    # Handle case where pred_max == pred_min (invalid interval)
     interval_width = interval_max - interval_min
-    # Add small epsilon to prevent division by zero and numerical instability
-    epsilon = EPSILON
     width_factor = torch.where(
-        interval_width <= epsilon,
+        interval_width <= EPSILON,
         torch.zeros_like(interval_max),
-        (effective_top - effective_bottom) / (interval_width + epsilon)
+        (effective_top - effective_bottom) / (interval_width + EPSILON)
     )
     
     # Calculate inclusion factor (f_i) exactly as in reward.py
-    # prices_in_bounds = sum(1 for price in hour_prices if pred_min <= price <= pred_max)
-    # inclusion_factor = prices_in_bounds / len(hour_prices)
-    
-    # Count prices within bounds for each sample
+    # Count USD prices within bounds for each sample
     prices_in_bounds = torch.sum(
-        (interval_min.unsqueeze(1) <= hour_prices) & (hour_prices <= interval_max.unsqueeze(1)),
+        (interval_min.unsqueeze(1) <= hour_prices_usd) & (hour_prices_usd <= interval_max.unsqueeze(1)),
         dim=1
     ).float()
     
-    inclusion_factor = prices_in_bounds / hour_prices.shape[1]  # Divide by number of price points
+    inclusion_factor = prices_in_bounds / hour_prices_usd.shape[1]  # Divide by number of price points
     
     # Final interval score is the product (exactly as in reward.py)
     interval_score = inclusion_factor * width_factor
@@ -132,24 +144,96 @@ def precog_loss(point_pred: torch.Tensor,
     # Convert to loss (higher score = lower loss)
     interval_loss = 1.0 - interval_score.mean()
     
-    # Combine point and interval losses with 1:1 weight
+    # Combine point and interval losses with equal weight
     total_loss = 0.5 * point_loss + 0.5 * interval_loss
-
-    # Add a penalty for invalid prediction outside the interval
-    total_loss = total_loss + 10 * (point_pred < min_price_target).float().mean() + 10 * (point_pred > max_price_target).float().mean()
+    
+    # Add penalty for predictions outside reasonable bounds (USD prices)
+    # For BTC, reasonable bounds might be ±50% from current price range
+    current_price_range = max_target_usd - min_target_usd
+    reasonable_bound = current_price_range * 0.5
+    
+    out_of_bounds_penalty = (
+        torch.relu(point_pred_usd - max_target_usd - reasonable_bound).mean() +
+        torch.relu(min_target_usd - reasonable_bound - point_pred_usd).mean() +
+        torch.relu(interval_min - min_target_usd - reasonable_bound).mean() +
+        torch.relu(max_target_usd + reasonable_bound - interval_max).mean()
+    )
+    
+    total_loss = total_loss + 0.01 * out_of_bounds_penalty
+    
+    # Safety check: ensure loss is not NaN or inf
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        print(f"Warning: Invalid loss detected in precog_loss")
+        print(f"  point_loss: {point_loss.item()}")
+        print(f"  interval_loss: {interval_loss.item()}")
+        print(f"  out_of_bounds_penalty: {out_of_bounds_penalty.item()}")
+        return torch.tensor(1.0, device=point_pred.device)  # Return reasonable fallback loss
     
     return total_loss
 
 
+def extract_current_prices_from_features(X: torch.Tensor, 
+                                       scaler: Optional[Any] = None,
+                                       preprocessor: Optional[Any] = None) -> torch.Tensor:
+    """
+    Extract current prices from the input feature tensor.
+    
+    Args:
+        X: Input feature tensor [batch_size, flattened_features]
+        scaler: Fitted scaler for inverse transform
+        preprocessor: Preprocessor object with feature structure info
+        
+    Returns:
+        Current prices tensor [batch_size]
+    """
+    if scaler is None or preprocessor is None:
+        print("Warning: Cannot extract current prices without scaler and preprocessor")
+        return torch.ones(X.shape[0], device=X.device) * 50000.0  # Dummy BTC price
+    
+    # Get preprocessor stats to understand feature structure
+    if hasattr(preprocessor, 'preprocessing_stats'):
+        stats = preprocessor.preprocessing_stats
+        n_per_timestep = stats.get('n_per_timestep_features', 29)
+        lookback = stats.get('lookback', 12)
+        static_features = stats.get('static_features', [])
+        
+        # Current close should be the first static feature
+        if 'current_close' in static_features:
+            current_close_idx = static_features.index('current_close')
+            # Calculate the position in the flattened feature vector
+            static_start_idx = n_per_timestep * lookback
+            current_close_feature_idx = static_start_idx + current_close_idx
+            
+            # Extract the scaled current close values
+            current_close_scaled = X[:, current_close_feature_idx]
+            
+            # Inverse transform to get actual USD prices
+            # We need to create a dummy array with the right shape for the scaler
+            dummy_features = torch.zeros((X.shape[0], X.shape[1]), device=X.device)
+            dummy_features[:, current_close_feature_idx] = current_close_scaled
+            
+            # Convert to numpy for sklearn scaler
+            dummy_features_np = dummy_features.detach().cpu().numpy()
+            dummy_features_unscaled = scaler.inverse_transform(dummy_features_np)
+            
+            # Extract the current close values
+            current_prices = torch.FloatTensor(dummy_features_unscaled[:, current_close_feature_idx]).to(X.device)
+            
+            return current_prices.clamp(min=EPSILON)
+    
+    print("Warning: Could not determine feature structure for current price extraction")
+    return torch.ones(X.shape[0], device=X.device) * 50000.0  # Dummy BTC price
+
+
 def evaluate_precog(model, data_loader, device, scaler=None) -> Dict[str, float]:
     """
-    Comprehensive evaluation system for precog mode that exactly matches the precog subnet scoring system.
+    Comprehensive evaluation system for precog mode using USD prices converted from relative returns.
     
     Args:
         model: Trained model
         data_loader: DataLoader for evaluation
         device: Device to run evaluation on
-        scaler: Optional scaler for inverse transformation
+        scaler: Scaler for extracting current price reference
     
     Returns:
         Dictionary with evaluation metrics
@@ -159,6 +243,7 @@ def evaluate_precog(model, data_loader, device, scaler=None) -> Dict[str, float]
     all_point_preds = []
     all_interval_preds = []
     all_targets = []
+    all_current_prices = []
     
     # Progress bar for evaluation
     eval_pbar = tqdm(data_loader, desc='Precog Evaluation', leave=False, ncols=100)
@@ -173,24 +258,39 @@ def evaluate_precog(model, data_loader, device, scaler=None) -> Dict[str, float]
                 print(f"Warning: NaN detected in evaluation input features")
                 continue
             
-            point_pred, interval_pred = model(batch_X)
+            predictions = model(batch_X)
+            
+            # Handle different prediction formats
+            if isinstance(predictions, tuple) and len(predictions) >= 2:
+                point_pred, interval_pred = predictions[0], predictions[1]
+            elif torch.is_tensor(predictions):
+                # If single tensor, assume it needs to be split
+                point_pred = predictions
+                interval_pred = torch.stack([point_pred, point_pred], dim=1)  # Dummy interval
+            else:
+                # Handle other formats
+                raise ValueError(f"Unknown prediction format: {type(predictions)}")
             
             # Debug: Check model output in evaluation
             if torch.isnan(point_pred).any() or torch.isnan(interval_pred).any():
                 print(f"Warning: NaN detected in evaluation model predictions")
                 continue
             
+            # Extract current prices from features (for relative return conversion)
+            current_prices = extract_current_prices_from_features(batch_X, scaler, getattr(data_loader.dataset, 'preprocessor', None))
+            
             # Precog loss calculation
-            loss = precog_loss(point_pred, interval_pred, batch_y, scaler)
+            loss = precog_loss(point_pred, interval_pred, batch_y, scaler, current_prices)
             
             # Collect predictions for detailed analysis
             all_point_preds.append(point_pred.cpu())
             all_interval_preds.append(interval_pred.cpu())
             all_targets.append(batch_y.cpu())
+            all_current_prices.append(current_prices.cpu())
             
-            # Check for NaN loss
+            # Check for invalid loss
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Warning: NaN/Inf loss in evaluation: {loss.item()}")
+                print(f"Warning: Invalid loss in evaluation: {loss.item()}")
                 continue
                 
             total_loss += loss.item()
@@ -201,93 +301,110 @@ def evaluate_precog(model, data_loader, device, scaler=None) -> Dict[str, float]
     # Check if we have any valid predictions
     if len(all_point_preds) == 0:
         print("Warning: No valid predictions collected during evaluation")
-        return {'total_loss': float('inf'), 'point_mape': float('inf'), 'interval_score': 0.0}
+        return {'total_loss': float('inf'), 'point_mae': float('inf'), 'interval_score': 0.0}
     
     # Concatenate all predictions
     all_point_preds = torch.cat(all_point_preds, dim=0)
     all_interval_preds = torch.cat(all_interval_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
+    all_current_prices = torch.cat(all_current_prices, dim=0)
     
-    # Extract targets exactly as in precog_loss
-    targets_reshaped = all_targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [close, low, high]
+    # Extract relative return targets and convert to USD prices
+    targets_reshaped = all_targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [point_return, min_return, max_return]
     
-    # Extract base targets:
-    exact_price_target = targets_reshaped[:, 11, 0]  # close at time step 11
-    min_price_target = targets_reshaped[:, :, 1].min(dim=1)[0]  # min of all low prices
-    max_price_target = targets_reshaped[:, :, 2].max(dim=1)[0]  # max of all high prices
-    hour_prices = targets_reshaped[:, :, :].view(-1, 36)  # All high, low, close prices [batch_size, 36]
-    hour_prices = hour_prices.unique(dim=1)
+    # Extract relative return targets:
+    point_return_target = targets_reshaped[:, 11, 0]  # point return at time step 11
+    min_return_target = targets_reshaped[:, :, 1].min(dim=1)[0]  # min of all min returns
+    max_return_target = targets_reshaped[:, :, 2].max(dim=1)[0]  # max of all max returns
+    hour_returns = targets_reshaped[:, :, 0]  # All point returns [batch_size, 12]
+    
+    # Convert to USD prices using current prices
+    all_point_preds_usd = all_current_prices * (1 + all_point_preds)
+    all_interval_preds_usd = torch.stack([
+        all_current_prices * (1 + all_interval_preds[:, 0]),
+        all_current_prices * (1 + all_interval_preds[:, 1])
+    ], dim=1)
+    
+    point_target_usd = all_current_prices * (1 + point_return_target)
+    min_target_usd = all_current_prices * (1 + min_return_target)
+    max_target_usd = all_current_prices * (1 + max_return_target)
+    hour_prices_usd = all_current_prices.unsqueeze(1) * (1 + hour_returns)
     
     # Basic data validation
-    print(f"  PRECOG EVALUATION DATA:")
-    print(f"    Predictions shape: {all_point_preds.shape}, {all_interval_preds.shape}")
+    print(f"  PRECOG EVALUATION DATA (USD Prices from Relative Returns):")
+    print(f"    Predictions shape: {all_point_preds_usd.shape}, {all_interval_preds_usd.shape}")
     print(f"    Targets shape: {all_targets.shape}")
-    print(f"    Hour prices shape: {hour_prices.shape}")
-    print(f"    Point pred range: [{all_point_preds.min().item():.2f}, {all_point_preds.max().item():.2f}]")
-    print(f"    Interval pred range: [{all_interval_preds.min().item():.2f}, {all_interval_preds.max().item():.2f}]")
-    print(f"    Exact target range: [{exact_price_target.min().item():.2f}, {exact_price_target.max().item():.2f}]")
+    print(f"    Hour prices shape: {hour_prices_usd.shape}")
+    print(f"    Point pred range: [${all_point_preds_usd.min().item():.2f}, ${all_point_preds_usd.max().item():.2f}]")
+    print(f"    Interval pred range: [${all_interval_preds_usd.min().item():.2f}, ${all_interval_preds_usd.max().item():.2f}]")
+    print(f"    Point target range: [${point_target_usd.min().item():.2f}, ${point_target_usd.max().item():.2f}]")
+    print(f"    Current prices range: [${all_current_prices.min().item():.2f}, ${all_current_prices.max().item():.2f}]")
     
-    # 1. Point Prediction Analysis
-    point_errors = torch.abs(all_point_preds - exact_price_target) / exact_price_target.clamp(min=EPSILON)
+    # 1. Point Prediction Analysis (USD prices)
+    point_errors = torch.abs(all_point_preds_usd - point_target_usd)
     avg_point_error = point_errors.mean().item()
     
     # Additional point metrics
-    mae = torch.abs(all_point_preds - exact_price_target).mean().item()
-    rmse = torch.sqrt(torch.mean((all_point_preds - exact_price_target) ** 2)).item()
+    mae = torch.abs(all_point_preds_usd - point_target_usd).mean().item()
+    rmse = torch.sqrt(torch.mean((all_point_preds_usd - point_target_usd) ** 2)).item()
     
-    # 2. Interval Analysis
-    interval_min = all_interval_preds[:, 0]
-    interval_max = all_interval_preds[:, 1]
+    # Mean Absolute Percentage Error for USD prices
+    mape = torch.mean(torch.abs((all_point_preds_usd - point_target_usd) / (point_target_usd + EPSILON))).item()
+    
+    # 2. Interval Analysis (USD prices)
+    interval_min = all_interval_preds_usd[:, 0]
+    interval_max = all_interval_preds_usd[:, 1]
     
     # Calculate width factor and inclusion factor
-    effective_top = torch.minimum(interval_max, max_price_target)
-    effective_bottom = torch.maximum(interval_min, min_price_target)
+    effective_top = torch.minimum(interval_max, max_target_usd)
+    effective_bottom = torch.maximum(interval_min, min_target_usd)
     
     interval_width = interval_max - interval_min
-    epsilon = EPSILON
     width_factor = torch.where(
-        interval_width <= epsilon,
+        interval_width <= EPSILON,
         torch.zeros_like(interval_max),
-        (effective_top - effective_bottom) / (interval_width + epsilon)
+        (effective_top - effective_bottom) / (interval_width + EPSILON)
     )
     
     prices_in_bounds = torch.sum(
-        (interval_min.unsqueeze(1) <= hour_prices) & (hour_prices <= interval_max.unsqueeze(1)),
+        (interval_min.unsqueeze(1) <= hour_prices_usd) & (hour_prices_usd <= interval_max.unsqueeze(1)),
         dim=1
     ).float()
     
-    inclusion_factor = prices_in_bounds / hour_prices.shape[1]
+    inclusion_factor = prices_in_bounds / hour_prices_usd.shape[1]
     
     # Final interval score
     interval_scores = inclusion_factor * width_factor
     avg_interval_score = interval_scores.mean().item()
     
     # 3. Comprehensive Results
-    print(f"  PRECOG POINT PREDICTION (1-hour ahead):")
-    print(f"    Average MAPE: {avg_point_error:.4f}")
-    print(f"    MAE: {mae:.4f}")
-    print(f"    RMSE: {rmse:.4f}")
-    print(f"    Target mean: {exact_price_target.mean().item():.2f}")
-    print(f"    Pred mean: {all_point_preds.mean().item():.2f}")
+    print(f"  PRECOG POINT PREDICTION (1-hour ahead USD price):")
+    print(f"    Average MAE: ${avg_point_error:.2f}")
+    print(f"    RMSE: ${rmse:.2f}")
+    print(f"    MAPE: {mape:.4f} ({mape*100:.2f}%)")
+    print(f"    Target mean: ${point_target_usd.mean().item():.2f}")
+    print(f"    Pred mean: ${all_point_preds_usd.mean().item():.2f}")
     
-    print(f"  PRECOG INTERVAL ANALYSIS (1-hour period):")
+    print(f"  PRECOG INTERVAL ANALYSIS (1-hour period USD prices):")
     print(f"    Average width factor: {width_factor.mean().item():.4f}")
     print(f"    Average inclusion factor: {inclusion_factor.mean().item():.4f}")
     print(f"    Average interval score: {avg_interval_score:.4f}")
+    print(f"    Average interval width: ${interval_width.mean().item():.2f}")
     
-    # Final precog subnet score
-    precog_score = 0.5 * avg_point_error + 0.5 * (1.0 - avg_interval_score)
-    print(f"  PRECOG SUBNET SCORE: {precog_score:.4f}")
+    # Final precog score for USD prices
+    precog_score = 0.5 * mape + 0.5 * (1.0 - avg_interval_score)
+    print(f"  PRECOG SCORE (USD Prices): {precog_score:.6f}")
     
     # Return comprehensive metrics
     return {
         'total_loss': total_loss / len(data_loader),
-        'point_mape': avg_point_error,
-        'point_mae': mae,
+        'point_mae': avg_point_error,
         'point_rmse': rmse,
+        'point_mape': mape,
         'width_factor': width_factor.mean().item(),
         'inclusion_factor': inclusion_factor.mean().item(),
         'interval_score': avg_interval_score,
+        'interval_width': interval_width.mean().item(),
         'precog_score': precog_score,
-        'num_samples': len(all_point_preds)
+        'num_samples': len(all_point_preds_usd)
     } 

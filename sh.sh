@@ -15,3 +15,6 @@ python train_modular.py --config config/tcn_precog.yaml
 
 # Train TFT model in synth mode
 python train_modular.py --config config/tft_synth.yaml
+
+
+# python train_all_predictors.py --predictors LightGBM --use-cv --config-filter precog

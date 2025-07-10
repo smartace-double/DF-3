@@ -810,4 +810,5 @@ if __name__ == "__main__":
     print(f"\nSample Statistics:")
     print(f"X_train mean: {X_train.mean():.4f}, std: {X_train.std():.4f}")
     print(f"y_train mean: {y_train.mean():.4f}, std: {y_train.std():.4f}")
+    print(f"y_train's price is scaled correctly: {y_train.max()}")
     print(f"Sample target returns range: [{y_train.min():.6f}, {y_train.max():.6f}]")

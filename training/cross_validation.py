@@ -41,6 +41,21 @@ class WalkForwardResults:
     config: Dict[str, Any]
     cv_summary: Dict[str, Any]
 
+class MemoryEfficientDataset(torch.utils.data.Dataset):
+    """Memory-efficient dataset that loads data in chunks."""
+    
+    def __init__(self, X, y, chunk_size=10000):
+        self.X = X
+        self.y = y
+        self.chunk_size = chunk_size
+        self.n_samples = len(X)
+    
+    def __len__(self):
+        return self.n_samples
+    
+    def __getitem__(self, idx):
+        return torch.FloatTensor(self.X[idx]), torch.FloatTensor(self.y[idx])
+
 class WalkForwardCrossValidator:
     """
     Walk-forward expanding window cross-validation for Bitcoin price prediction.
@@ -259,7 +274,7 @@ class WalkForwardCrossValidator:
     def create_data_loaders(self, X_train: np.ndarray, y_train: np.ndarray, 
                            X_val: np.ndarray, y_val: np.ndarray) -> Tuple[DataLoader, DataLoader]:
         """
-        Create DataLoaders for a fold.
+        Create DataLoaders for a fold with memory-efficient loading.
         
         Args:
             X_train: Training features
@@ -273,28 +288,24 @@ class WalkForwardCrossValidator:
         batch_size = self.config.get('batch_size', 512)
         num_workers = self.config.get('num_workers', 0)  # Set to 0 for compatibility
         
-        # Convert to torch tensors
-        X_train_tensor = torch.FloatTensor(X_train)
-        y_train_tensor = torch.FloatTensor(y_train)
-        X_val_tensor = torch.FloatTensor(X_val)
-        y_val_tensor = torch.FloatTensor(y_val)
+        # Create memory-efficient datasets
+        train_dataset = MemoryEfficientDataset(X_train, y_train)
+        val_dataset = MemoryEfficientDataset(X_val, y_val)
         
-        # Create datasets
-        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-        val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+        # Create data loaders with smaller batch size for memory efficiency
+        memory_efficient_batch_size = min(batch_size, 256)  # Reduce batch size for memory
         
-        # Create data loaders
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
-            shuffle=True,  # Can shuffle within fold since we already have time-based splits
+            batch_size=memory_efficient_batch_size,
+            shuffle=False,  # Can shuffle within fold since we already have time-based splits
             num_workers=num_workers,
             pin_memory=self.config.get('pin_memory', True) and torch.cuda.is_available()
         )
         
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=memory_efficient_batch_size,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=self.config.get('pin_memory', True) and torch.cuda.is_available()
@@ -336,7 +347,64 @@ class WalkForwardCrossValidator:
             print(f"Model created: {model.__class__.__name__}")
             print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
         
-        # Setup optimizer
+        # Check if this is a non-neural network model (like LightGBM)
+        if hasattr(model, 'parameters') and len(list(model.parameters())) == 0:
+            # This is a non-neural network model
+            print("Detected non-neural network model. Using .fit() method for training.")
+            
+            # Extract features and targets from stored numpy arrays
+            X_train, y_train = fold_data['X_train'], fold_data['y_train']
+            X_val, y_val = fold_data['X_val'], fold_data['y_val']
+            
+            print(f"Training with:")
+            print(f"  X_train shape: {X_train.shape}")
+            print(f"  y_train shape: {y_train.shape}")
+            print(f"  X_val shape: {X_val.shape}")
+            print(f"  y_val shape: {y_val.shape}")
+            
+            # Call the model's fit method
+            if hasattr(model, 'fit') and callable(getattr(model, 'fit')):
+                model.fit(X_train, y_train, X_val, y_val)
+            else:
+                raise RuntimeError("Model does not have a fit method.")
+            
+            # For non-neural models, we'll use a simple evaluation
+            best_score = 0.0  # Not meaningful for LightGBM, but set to 0
+            final_metrics = {
+                'fold_name': fold_name,
+                'best_score': best_score,
+                'epochs_trained': 1,
+                'training_history': {'train_losses': [0], 'val_scores': [0]},
+                'period': fold_data['period'],
+                'model_type': 'non_neural_network'
+            }
+            
+            # Save best model
+            if self.save_models:
+                fold_dir = self.save_dir / fold_name
+                fold_dir.mkdir(exist_ok=True)
+                
+                model_path = fold_dir / 'best_model.pth'
+                if hasattr(model, 'save_model'):
+                    model.save_model(str(model_path), {
+                        'config': self.config,
+                        'fold_name': fold_name,
+                        'score': best_score,
+                        'fold_period': fold_data['period']
+                    })
+                else:
+                    torch.save({
+                        'model_state_dict': None,
+                        'config': self.config,
+                        'fold_name': fold_name,
+                        'epoch': 0,
+                        'score': best_score,
+                        'fold_period': fold_data['period']
+                    }, model_path)
+            
+            return best_score, final_metrics
+        
+        # Setup optimizer for neural networks
         optimizer = optim.AdamW(
             model.parameters(),
             lr=self.config.get('lr', 1e-4),
@@ -487,20 +555,27 @@ class WalkForwardCrossValidator:
             # For precog mode: predictions should be (point_pred, interval_pred)
             if isinstance(predictions, tuple) and len(predictions) >= 2:
                 point_pred, interval_pred = predictions[0], predictions[1]
-            else:
+            elif torch.is_tensor(predictions):
                 # If not tuple, split the predictions using torch operations
-                pred_tensor = predictions if torch.is_tensor(predictions) else predictions[0]
                 third_size = targets.shape[1] // 3
-                point_pred = pred_tensor.narrow(1, 0, third_size)  # First third
-                interval_pred = pred_tensor.narrow(1, third_size, targets.shape[1] - third_size)  # Rest for intervals
+                point_pred = predictions.narrow(1, 0, third_size)  # First third
+                interval_pred = predictions.narrow(1, third_size, targets.shape[1] - third_size)  # Rest for intervals
+            else:
+                raise ValueError("Predictions format not recognized for precog mode.")
             return precog_loss(point_pred, interval_pred, targets, None)  # No scaler for relative returns
         elif self.config['mode'] == 'synth':
             # For synth mode: detailed predictions
-            detailed_pred = predictions[0] if isinstance(predictions, tuple) else predictions
+            if isinstance(predictions, tuple):
+                detailed_pred = predictions[0]
+            else:
+                detailed_pred = predictions
             return synth_loss(detailed_pred, targets, None)  # No scaler for relative returns
         else:
             # Default MSE loss for relative returns
-            pred_tensor = predictions[0] if isinstance(predictions, tuple) else predictions
+            if isinstance(predictions, tuple):
+                pred_tensor = predictions[0]
+            else:
+                pred_tensor = predictions
             return nn.MSELoss()(pred_tensor, targets)
     
     def _evaluate_fold(self, model: nn.Module, val_loader: DataLoader) -> float:

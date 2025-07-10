@@ -12,6 +12,7 @@ Key Features:
 - Comprehensive evaluation metrics
 - Hyperparameter optimization support
 - Model saving and loading
+- Memory-efficient data loading
 """
 
 import argparse
@@ -60,6 +61,21 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
 
+class MemoryEfficientDataset(torch.utils.data.Dataset):
+    """Memory-efficient dataset that loads data on-demand."""
+    
+    def __init__(self, X, y, chunk_size=10000):
+        self.X = X
+        self.y = y
+        self.chunk_size = chunk_size
+        self.n_samples = len(X)
+    
+    def __len__(self):
+        return self.n_samples
+    
+    def __getitem__(self, idx):
+        return torch.FloatTensor(self.X[idx]), torch.FloatTensor(self.y[idx])
+
 class BTCDataset:
     """Dataset class for Bitcoin price prediction using the preprocessing module."""
     
@@ -67,17 +83,17 @@ class BTCDataset:
         self.dataset_path = dataset_path
         self.lookback = lookback
         self.horizon = horizon
-        self.preprocessor = None
-        self.train_df = None
-        self.val_df = None
-        self.test_df = None
+        self._preprocessor = None
+        self.train_data = None
+        self.val_data = None
+        self.test_data = None
         
     def load_dataset(self):
         """Load and preprocess the dataset using the preprocessing module."""
         print(f"Loading dataset from {self.dataset_path}")
         
         # Use the preprocessing module
-        self.train_df, self.val_df, self.test_df, self.preprocessor = preprocess_bitcoin_data(
+        self.train_data, self.val_data, self.test_data, self._preprocessor = preprocess_bitcoin_data(
             dataset_path=self.dataset_path,
             lookback=self.lookback,
             horizon=self.horizon,
@@ -85,57 +101,46 @@ class BTCDataset:
             save_dir='preprocessing/artifacts'
         )
         
-        # Create DataLoaders
-        print("Creating DataLoaders...")
-        batch_size = 512
-        train_loader = self._create_dataloader(self.train_df, batch_size=batch_size, shuffle=False)
-        val_loader = self._create_dataloader(self.val_df, batch_size=batch_size, shuffle=False)
-        test_loader = self._create_dataloader(self.test_df, batch_size=batch_size, shuffle=False)
+        # Create DataLoaders with memory-efficient settings
+        print("Creating memory-efficient DataLoaders...")
+        batch_size = min(512, 256)  # Reduce default batch size for memory efficiency
+        train_loader = self._create_dataloader(self.train_data, batch_size=batch_size, shuffle=False)
+        val_loader = self._create_dataloader(self.val_data, batch_size=batch_size, shuffle=False)
+        test_loader = self._create_dataloader(self.test_data, batch_size=batch_size, shuffle=False)
         
-        print(f"DataLoaders created successfully")
+        print(f"Memory-efficient DataLoaders created successfully")
         print(f"  Train batches: {len(train_loader)}")
         print(f"  Val batches: {len(val_loader)}")
         print(f"  Test batches: {len(test_loader)}")
         
         return train_loader, val_loader, test_loader
     
-    def _create_dataloader(self, df, batch_size=64, shuffle=False):
-        """Create a DataLoader from DataFrame."""
-        class SequenceDataset(torch.utils.data.Dataset):
-            def __init__(self, df, lookback, horizon, feature_cols, target_cols):
-                self.df = df
-                self.lookback = lookback
-                self.horizon = horizon
-                self.feature_cols = feature_cols
-                self.target_cols = target_cols
-                self.max_i = len(df) - lookback - horizon
-
-            def __len__(self):
-                return max(0, self.max_i - self.lookback)
-            
-            def __getitem__(self, idx):
-                i = idx + self.lookback
-                
-                # Features (lookback window) - exclude target columns
-                feature_data = self.df[self.feature_cols].iloc[i-self.lookback:i].values
-                target_data = self.df[self.target_cols].iloc[i].values
-                
-                return torch.FloatTensor(feature_data), torch.FloatTensor(target_data)
+    def _create_dataloader(self, data_tuple, batch_size=64, shuffle=False):
+        """Create a memory-efficient DataLoader from numpy arrays."""
+        # Unpack data tuple
+        X, y = data_tuple
         
-        # Set feature columns if not already set
-        if not hasattr(self, 'feature_cols'):
-            self.feature_cols = [col for col in df.columns if not col.startswith('target_')]
-            self.target_cols = [col for col in df.columns if col.startswith('target_')]
-
-        print(f"Feature columns: {self.feature_cols}")
+        # Create memory-efficient dataset
+        dataset = MemoryEfficientDataset(X, y)
         
-        dataset = SequenceDataset(df, self.lookback, self.horizon, self.feature_cols, self.target_cols)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=4, pin_memory=True, persistent_workers=True)
+        return DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=shuffle, 
+            num_workers=min(4, 2),  # Reduce workers for memory efficiency
+            pin_memory=True, 
+            persistent_workers=False  # Disable persistent workers to save memory
+        )
     
     @property
     def scaler(self):
         """Get the scaler from the preprocessor."""
         return self.preprocessor.scaler if self.preprocessor else None
+    
+    @property
+    def preprocessor(self):
+        """Get the preprocessor instance."""
+        return getattr(self, '_preprocessor', None)
 
 class ModularTrainer:
     """
@@ -183,7 +188,7 @@ class ModularTrainer:
         
     def setup_data(self):
         """Setup data loaders based on configuration."""
-        print("Setting up data loaders...")
+        print("Setting up memory-efficient data loaders...")
         
         # Create dataset
         self.dataset = BTCDataset(
@@ -209,9 +214,14 @@ class ModularTrainer:
             self.setup_data()
         
         # Get input size from first batch
-        for batch_X, batch_y in self.train_loader:
-            input_size = batch_X.shape[2]
-            break
+        if self.train_loader is not None:
+            for batch_X, batch_y in self.train_loader:
+                # The preprocessor flattens the features into a single vector
+                # Each sample has (lookback * n_per_timestep_features + n_static_features) features
+                input_size = batch_X.shape[1]  # Use shape[1] since data is already flattened
+                break
+        else:
+            raise RuntimeError("Train loader not initialized. Call setup_data() first.")
         
         # Create model using factory
         self.model = create_predictor_from_config(self.config, input_size)
@@ -309,7 +319,7 @@ class ModularTrainer:
                 self.scaler.update()
             else:
                 predictions = self.model(batch_X)
-                loss = self._calculate_loss(predictions, batch_y)
+                loss = self._calculate_loss(predictions, batch_y, batch_X)
                 
                 # Backward pass
                 loss.backward()
@@ -362,7 +372,7 @@ class ModularTrainer:
                     continue
                 
                 predictions = self.model(batch_X)
-                loss = self._calculate_loss(predictions, batch_y)
+                loss = self._calculate_loss(predictions, batch_y, batch_X)
                 
                 # Skip if loss is NaN or inf
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -376,16 +386,30 @@ class ModularTrainer:
         
         return total_loss / max(batch_count, 1)
     
-    def _calculate_loss(self, predictions: Tuple[torch.Tensor, ...], targets: torch.Tensor) -> torch.Tensor:
+    def _calculate_loss(self, predictions: Tuple[torch.Tensor, ...], targets: torch.Tensor, batch_X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Calculate loss based on model mode."""
         if self.dataset is None:
             raise RuntimeError("Dataset not initialized. Call setup_data() first.")
         
         if self.config['mode'] == 'precog':
-            point_pred, interval_pred = predictions
-            return precog_loss(point_pred, interval_pred, targets, self.dataset.scaler)
+            if isinstance(predictions, tuple) and len(predictions) >= 2:
+                point_pred = predictions[0]
+                interval_pred = predictions[1]
+            elif torch.is_tensor(predictions):
+                point_pred = predictions
+                interval_pred = predictions
+            else:
+                raise ValueError("Predictions format not recognized for precog mode.")
+            
+            # Extract current prices from input features for relative return conversion
+            current_prices = None
+            if batch_X is not None:
+                from losses.precog_loss import extract_current_prices_from_features
+                current_prices = extract_current_prices_from_features(batch_X, self.dataset.scaler, self.dataset.preprocessor)
+            
+            return precog_loss(point_pred, interval_pred, targets, self.dataset.scaler, current_prices)
         elif self.config['mode'] == 'synth':
-            detailed_pred = predictions[0]
+            detailed_pred = predictions[0] if isinstance(predictions, tuple) else predictions
             return synth_loss(detailed_pred, targets, self.dataset.scaler)
         else:
             raise ValueError(f"Unknown mode: {self.config['mode']}")
@@ -402,26 +426,13 @@ class ModularTrainer:
             if self.dataset is None:
                 raise RuntimeError("Dataset not initialized. Call setup_data() first.")
             
-            # Extract features and targets from stored DataFrames
-            train_df = self.dataset.train_df
-            val_df = self.dataset.val_df
-            
-            if train_df is None or val_df is None:
+            # Extract features and targets from stored numpy arrays
+            if self.dataset.train_data is None or self.dataset.val_data is None:
                 raise RuntimeError("Training or validation data not available.")
             
-            feature_cols = [col for col in train_df.columns if not col.startswith('target_')]
-            target_cols = [col for col in train_df.columns if col.startswith('target_')]
-            
-            # Prepare data for LightGBM (flatten the sequence data)
-            X_train_flat = train_df[feature_cols].values.astype(np.float32)
-            y_train = train_df[target_cols].values.astype(np.float32)
-            X_val_flat = val_df[feature_cols].values.astype(np.float32)
-            y_val = val_df[target_cols].values.astype(np.float32)
-            
-            # For LightGBM, we need to flatten the sequence data
-            # The data is already in the correct format from preprocessing
-            X_train = X_train_flat
-            X_val = X_val_flat
+            # Data is already in the correct format from preprocessing
+            X_train, y_train = self.dataset.train_data
+            X_val, y_val = self.dataset.val_data
             
             print(f"Training LightGBM with:")
             print(f"  X_train shape: {X_train.shape}")
@@ -430,8 +441,9 @@ class ModularTrainer:
             print(f"  y_val shape: {y_val.shape}")
             
             # Call the model's fit method
-            if hasattr(self.model, 'fit'):
-                self.model.fit(X_train, y_train, X_val, y_val)
+            fit_method = getattr(self.model, 'fit', None)
+            if fit_method is not None and callable(fit_method):
+                fit_method(X_train, y_train, X_val, y_val)
             else:
                 raise RuntimeError("Model does not have a fit method.")
             
@@ -507,8 +519,9 @@ class ModularTrainer:
             'config': self.config
         }
         
-        if hasattr(self.model, 'save_model'):
-            self.model.save_model(str(model_path), additional_info)
+        save_method = getattr(self.model, 'save_model', None)
+        if save_method is not None and callable(save_method):
+            save_method(str(model_path), additional_info)
         else:
             # For models without save_model method, save using torch
             torch.save({
@@ -549,7 +562,7 @@ class ModularTrainer:
                     continue
                 
                 predictions = self.model(batch_X)
-                loss = self._calculate_loss(predictions, batch_y)
+                loss = self._calculate_loss(predictions, batch_y, batch_X)
                 
                 # Skip if loss is NaN or inf
                 if torch.isnan(loss) or torch.isinf(loss):

@@ -99,50 +99,68 @@ class LightGBMBitcoinPredictor(BaseBitcoinPredictor):
         Prepare features for LightGBM training.
         
         Args:
-            X: Input features [batch_size, sequence_length, features]
+            X: Input features [batch_size, flattened_features]
+                The features are already flattened by the preprocessor in the format:
+                [per_timestep_features * lookback + static_features]
             
         Returns:
-            Flattened features for LightGBM
+            Features with additional statistical measures
         """
-        # LightGBM expects 2D input, so flatten the sequence dimension
-        batch_size, seq_len, n_features = X.shape
+        if not isinstance(X, np.ndarray):
+            raise TypeError("Input features X must be a numpy array")
         
-        # Flatten sequence and features
-        X_flat = X.reshape(batch_size, seq_len * n_features)
+        if X.size == 0:
+            raise ValueError("Input features X cannot be empty")
         
-        # Add lag features
+        batch_size = X.shape[0]
+        
+        # Define feature dimensions from preprocessing stats
+        n_per_timestep = 29  # From preprocessing stats
+        lookback = 72  # From config
+        n_static = 6  # From preprocessing stats
+        
+        # Validate input dimensions
+        expected_features = n_per_timestep * lookback + n_static
+        if X.shape[1] != expected_features:
+            raise ValueError(
+                f"Expected {expected_features} features "
+                f"({n_per_timestep} per-timestep features × {lookback} timesteps + {n_static} static features) "
+                f"but got {X.shape[1]} features"
+            )
+        
+        # Add statistical features
         X_features = []
         for i in range(batch_size):
             sample_features = []
             
-            # Add flattened sequence features
-            sample_features.extend(X_flat[i])
+            # Add original flattened features
+            sample_features.extend(X[i].tolist())  # Convert to list to avoid numpy array issues
             
-            # Add statistical features from the sequence
-            sample_data = X[i]  # [seq_len, n_features]
+            # Extract per-timestep features
+            per_timestep_data = X[i, :n_per_timestep * lookback].reshape(lookback, n_per_timestep)
             
-            # Statistical features for each feature dimension
-            for feat_idx in range(n_features):
-                feat_seq = sample_data[:, feat_idx]
+            # Calculate statistics for each per-timestep feature
+            for feat_idx in range(n_per_timestep):
+                feat_seq = per_timestep_data[:, feat_idx]
                 
                 # Basic statistics
                 sample_features.extend([
-                    np.mean(feat_seq),
-                    np.std(feat_seq),
-                    np.min(feat_seq),
-                    np.max(feat_seq),
-                    np.median(feat_seq),
-                    feat_seq[-1],  # Last value
-                    feat_seq[-1] - feat_seq[0],  # Change from first to last
-                    np.sum(feat_seq > 0),  # Count of positive values
+                    float(np.mean(feat_seq)),  # Convert numpy types to Python float
+                    float(np.std(feat_seq)),
+                    float(np.min(feat_seq)),
+                    float(np.max(feat_seq)),
+                    float(np.median(feat_seq)),
+                    float(feat_seq[-1]),  # Last value
+                    float(feat_seq[-1] - feat_seq[0]),  # Change from first to last
+                    float(np.sum(feat_seq > 0)),  # Count of positive values
                 ])
                 
                 # Trend features
                 if len(feat_seq) > 1:
-                    sample_features.append(feat_seq[-1] - feat_seq[-2])  # Last change
-                    sample_features.append(np.mean(np.diff(feat_seq)))  # Average change
+                    sample_features.append(float(feat_seq[-1] - feat_seq[-2]))  # Last change
+                    sample_features.append(float(np.mean(np.diff(feat_seq))))  # Average change
                 else:
-                    sample_features.extend([0, 0])
+                    sample_features.extend([0.0, 0.0])
             
             X_features.append(sample_features)
         
