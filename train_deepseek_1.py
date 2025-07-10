@@ -41,6 +41,7 @@ from typing import Tuple, List, Optional
 import warnings
 import torch.nn.functional as F
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 warnings.filterwarnings('ignore')
 
 EPSILON = 1e-4
@@ -312,7 +313,7 @@ class BTCDataset:
         print(f"Feature columns: {self.feature_cols}")
         
         dataset = SequenceDataset(df, self.lookback, self.horizon, self.feature_cols, self.target_cols)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=8, pin_memory=True)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=4, pin_memory=True, persistent_workers=True)
     
         
     def clean_data(self, df):
@@ -592,40 +593,23 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     
     # Convert scaled predictions back to original scale for price-related features
     if scaler is not None:
-        # Get scaler parameters for manual inverse transform
-        mean_ = torch.FloatTensor(scaler.mean_).to(point_pred.device)
-        scale_ = torch.FloatTensor(scaler.scale_).to(point_pred.device)
+        # Cache scaler parameters on GPU to avoid repeated CPU-GPU transfers
+        if not hasattr(challenge_loss, '_scaler_cache'):
+            challenge_loss._scaler_cache = {
+                'mean': torch.FloatTensor(scaler.mean_).to(point_pred.device),
+                'scale': torch.FloatTensor(scaler.scale_).to(point_pred.device),
+                'price_indices': torch.tensor([3, 1, 2], device=point_pred.device)  # [close, high, low]
+            }
         
-        # Get the indices of price-related features (close, high, low)
-        # We know the order of features from the dataset: ['open', 'high', 'low', 'close', ...]
-        # So close=3, high=1, low=2 (0-indexed)
-        price_indices = [3, 1, 2]  # [close, high, low] indices
+        cache = challenge_loss._scaler_cache
+        mean_ = cache['mean']
+        scale_ = cache['scale']
+        price_indices = cache['price_indices']
         
-        # Debug: Print scaler info
-        # print(f"DEBUG: Scaler mean shape: {mean_.shape}, scale shape: {scale_.shape}")
-        # print(f"DEBUG: Price indices: {price_indices}")
-        # print(f"DEBUG: Scaler mean for close: {mean_[price_indices[0]]:.4f}, scale: {scale_[price_indices[0]]:.4f}")
-        # print(f"DEBUG: Before inverse transform - point_pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
-        # print(f"DEBUG: Before inverse transform - exact_price_target range: [{exact_price_target.min().item():.4f}, {exact_price_target.max().item():.4f}]")
-        # print(f"DEBUG: Sample point_pred: {point_pred[:3]}")
-        # print(f"DEBUG: Sample exact_price_target: {exact_price_target[:3]}")
-        
-        # Manual inverse transform for price predictions (maintains gradients)
+        # Efficient GPU-based inverse transform (vectorized operations)
         point_pred_unscaled = point_pred * scale_[price_indices[0]] + mean_[price_indices[0]]
         interval_min_unscaled = interval_pred[:, 0] * scale_[price_indices[1]] + mean_[price_indices[1]]
         interval_max_unscaled = interval_pred[:, 1] * scale_[price_indices[2]] + mean_[price_indices[2]]
-        
-        
-        # Debug: Show target transformation
-        # print(f"DEBUG: Target transformation:")
-        # print(f"  exact_price_target (already real): {exact_price_target[:5]}")
-        # print(f"  min_price_target (already real): {min_price_target[:5]}")
-        # print(f"  max_price_target (already real): {max_price_target[:5]}")
-        
-        
-        # # Debug: Print after inverse transform
-        # print(f"DEBUG: After inverse transform - point_pred range: [{point_pred_unscaled.min().item():.4f}, {point_pred_unscaled.max().item():.4f}]")
-        # print(f"DEBUG: After inverse transform - exact_price_target range: [{exact_price_target.min().item():.4f}, {exact_price_target.max().item():.4f}]")
         
         # Use unscaled values for calculations
         point_pred = point_pred_unscaled
@@ -814,6 +798,7 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
         torch.backends.cudnn.deterministic = False
         print(f"Using GPU: {torch.cuda.get_device_name()}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"Initial GPU Memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated")
     else:
         print("Using CPU")
     
@@ -848,6 +833,9 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
         steps_per_epoch=len(train_loader),
         epochs=params['epochs']
     )
+    
+    # Mixed precision training for better GPU efficiency
+    scaler = GradScaler() if torch.cuda.is_available() else None
     
     # Training loop
     best_val_score = float('inf')
@@ -887,34 +875,68 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
                 print(f"  NaN count: {torch.isnan(batch_y).sum().item()}")
                 continue
             
-            point_pred, interval_pred = model(batch_X)
+            # Mixed precision training
+            if scaler is not None:
+                with autocast():
+                    point_pred, interval_pred = model(batch_X)
+                    
+                    # Debug: Check model output
+                    if torch.isnan(point_pred).any() or torch.isnan(interval_pred).any():
+                        print(f"Warning: NaN detected in model predictions")
+                        print(f"  point_pred shape: {point_pred.shape}")
+                        print(f"  interval_pred shape: {interval_pred.shape}")
+                        print(f"  point_pred NaN count: {torch.isnan(point_pred).sum().item()}")
+                        print(f"  interval_pred NaN count: {torch.isnan(interval_pred).sum().item()}")
+                        print(f"  batch_X range: [{batch_X.min().item():.4f}, {batch_X.max().item():.4f}]")
+                        print(f"  batch_y range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
+                        continue
+                    
+                    # Challenge-specific loss with scaler for real price evaluation
+                    loss = challenge_loss(point_pred, interval_pred, batch_y, scaler)
+                    
+                    # Check for NaN loss
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"Warning: NaN/Inf loss detected: {loss.item()}")
+                        print(f"  Point pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
+                        print(f"  Interval pred range: [{interval_pred.min().item():.4f}, {interval_pred.max().item():.4f}]")
+                        print(f"  Targets range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
+                        continue
+                
+                # Scale loss and backward pass
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), params.get('grad_clip', 1.0))
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                point_pred, interval_pred = model(batch_X)
+                
+                # Debug: Check model output
+                if torch.isnan(point_pred).any() or torch.isnan(interval_pred).any():
+                    print(f"Warning: NaN detected in model predictions")
+                    print(f"  point_pred shape: {point_pred.shape}")
+                    print(f"  interval_pred shape: {interval_pred.shape}")
+                    print(f"  point_pred NaN count: {torch.isnan(point_pred).sum().item()}")
+                    print(f"  interval_pred NaN count: {torch.isnan(interval_pred).sum().item()}")
+                    print(f"  batch_X range: [{batch_X.min().item():.4f}, {batch_X.max().item():.4f}]")
+                    print(f"  batch_y range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
+                    continue
+                
+                # Challenge-specific loss with scaler for real price evaluation
+                loss = challenge_loss(point_pred, interval_pred, batch_y, scaler)
+                
+                # Check for NaN loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: NaN/Inf loss detected: {loss.item()}")
+                    print(f"  Point pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
+                    print(f"  Interval pred range: [{interval_pred.min().item():.4f}, {interval_pred.max().item():.4f}]")
+                    print(f"  Targets range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
+                    continue
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), params.get('grad_clip', 1.0))
+                optimizer.step()
             
-            # Debug: Check model output
-            if torch.isnan(point_pred).any() or torch.isnan(interval_pred).any():
-                print(f"Warning: NaN detected in model predictions")
-                print(f"  point_pred shape: {point_pred.shape}")
-                print(f"  interval_pred shape: {interval_pred.shape}")
-                print(f"  point_pred NaN count: {torch.isnan(point_pred).sum().item()}")
-                print(f"  interval_pred NaN count: {torch.isnan(interval_pred).sum().item()}")
-                print(f"  batch_X range: [{batch_X.min().item():.4f}, {batch_X.max().item():.4f}]")
-                print(f"  batch_y range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
-                continue
-            
-            # Challenge-specific loss with scaler for real price evaluation
-            loss = challenge_loss(point_pred, interval_pred, batch_y, scaler)
-            
-            # Check for NaN loss
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Warning: NaN/Inf loss detected: {loss.item()}")
-                print(f"  Point pred range: [{point_pred.min().item():.4f}, {point_pred.max().item():.4f}]")
-                print(f"  Interval pred range: [{interval_pred.min().item():.4f}, {interval_pred.max().item():.4f}]")
-                print(f"  Targets range: [{batch_y.min().item():.4f}, {batch_y.max().item():.4f}]")
-                continue
-            
-            loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(model.parameters(), params.get('grad_clip', 1.0))
-            optimizer.step()
             scheduler.step()
             
             train_loss += loss.item()
@@ -925,6 +947,10 @@ def train_with_cv(train_loader, val_loader, params, save_dir='models', trial_nam
                 'Loss': f'{loss.item():.4f}',
                 'Avg': f'{train_loss/batch_count:.4f}'
             })
+        
+        # Clear GPU cache periodically
+        if torch.cuda.is_available() and batch_idx % 50 == 0:
+            torch.cuda.empty_cache()
         
         # Validation with progress bar
         val_score = evaluate_with_progress(model, val_loader, device, scaler)
@@ -1038,7 +1064,7 @@ def evaluate_with_progress(model, data_loader, device, scaler=None):
         print("Warning: No valid predictions collected during evaluation")
         return float('inf')
     
-    # Concatenate all predictions
+    # Concatenate all predictions (efficient GPU operation)
     all_point_preds = torch.cat(all_point_preds, dim=0)
     all_interval_preds = torch.cat(all_interval_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
