@@ -1,3 +1,9 @@
 *.csv
 /prec-venv
 /precog/
+
+# all __pycache__ folders and subfolders
+__pycache__/
+
+# all .pyc files
+*.pyc
