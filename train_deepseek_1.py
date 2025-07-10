@@ -590,6 +590,8 @@ def challenge_loss(point_pred, interval_pred, targets, scaler=None):
     
     # 4. All close prices for inclusion factor calculation
     hour_prices = targets_reshaped[:, :, :].view(-1, 36)  # All high, low, close prices [batch_size, 36]
+    # remove duplicated hour prices
+    hour_prices = hour_prices.unique(dim=1)
     
     # Convert scaled predictions back to original scale for price-related features
     if scaler is not None:
@@ -1088,6 +1090,9 @@ def evaluate_with_progress(model, data_loader, device, scaler=None):
     
     # 4. All close prices for inclusion factor calculation
     hour_prices = targets_reshaped[:, :, :].view(-1, 36)  # All high, low, close prices [batch_size, 36]
+
+    # remove duplicated hour prices
+    hour_prices = hour_prices.unique(dim=1)
     
     # Basic data validation
     print(f"  DATA VALIDATION:")
