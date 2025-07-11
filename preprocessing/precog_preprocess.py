@@ -262,8 +262,9 @@ class BitcoinPreprocessor:
         ]
         
         # Define static features (only at final timestep)
+        # NOTE: current_close is now moved to target features (37th target)
         self.static_feature_names = [
-            'current_close', 'log_current_close',
+            'log_current_close',
             'hour_sin', 'hour_cos',
             'day_of_week_sin', 'day_of_week_cos'
         ]
@@ -421,8 +422,8 @@ class BitcoinPreprocessor:
         df['hour'] = df['date'].dt.hour
         df['day_of_week'] = df['date'].dt.dayofweek
         
-        # Current close prices
-        df['current_close'] = df['close']
+        # Current close prices (note: current_close is now a target feature)
+        df['current_close'] = df['close']  # Still needed for target creation
         df['log_current_close'] = np.log(df['close'])
         
         # Cyclical time encoding
@@ -443,6 +444,7 @@ class BitcoinPreprocessor:
     def create_relative_return_targets(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Create relative return targets instead of absolute prices.
+        Include current_close as the 37th target feature.
         
         Args:
             df: DataFrame with features
@@ -481,6 +483,10 @@ class BitcoinPreprocessor:
             df[col_max] = max_return
             target_columns.append(col_max)
         
+        # Add current_close as the 37th target feature
+        df['target_current_close'] = current_close
+        target_columns.append('target_current_close')
+        
         self.target_columns = target_columns
         
         # Drop rows with NaN targets
@@ -489,7 +495,7 @@ class BitcoinPreprocessor:
         after_drop = len(df)
         
         print(f"Relative return targets created:")
-        print(f"  Target columns: {len(self.target_columns)}")
+        print(f"  Target columns: {len(self.target_columns)} (including current_close)")
         print(f"  Rows after dropping NaN targets: {before_drop} -> {after_drop}")
         
         return df

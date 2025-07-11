@@ -43,8 +43,20 @@ def precog_loss(point_pred: torch.Tensor,
         print(f"  NaN count: {torch.isnan(targets).sum().item()}")
         return torch.tensor(float('inf'), device=point_pred.device)
     
-    # Reshape targets to [batch_size, 12, 3] for easier processing
-    targets_reshaped = targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [point_return, min_return, max_return]
+    # Extract current_close from targets (37th feature, index 36) and reshape the rest
+    if targets.shape[1] >= 37:
+        # Extract current prices from 37th feature
+        extracted_current_prices = targets[:, 36]  # Current close prices
+        # Use the first 36 features for relative returns
+        relative_return_targets = targets[:, :36]
+    else:
+        print(f"Warning: Expected 37 target features, got {targets.shape[1]}")
+        relative_return_targets = targets
+        extracted_current_prices = torch.ones(targets.shape[0], device=targets.device) * 50000.0  # Dummy
+        raise ValueError("Stop Here due to don't have current close target")
+    
+    # Reshape relative return targets to [batch_size, 12, 3] for easier processing
+    targets_reshaped = relative_return_targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [point_return, min_return, max_return]
     
     # Extract relative return targets:
     # 1. Point return at the last time step (index 11)
@@ -59,29 +71,9 @@ def precog_loss(point_pred: torch.Tensor,
     # 4. All point returns for inclusion factor calculation
     hour_returns = targets_reshaped[:, :, 0]  # All point returns [batch_size, 12]
     
-    # Get current prices for conversion (extract from scaler if not provided)
+    # Use extracted current prices if current_prices parameter is not provided
     if current_prices is None:
-        if scaler is not None:
-            # The current_close is one of the static features
-            # In the preprocessing, static features are at the end of the feature vector
-            # We need to find the index of 'current_close' in the static features
-            # Based on the preprocessing code, static features are:
-            # ['current_close', 'log_current_close', 'hour_sin', 'hour_cos', 'day_of_week_sin', 'day_of_week_cos']
-            # So current_close is at index 0 of static features
-            
-            # The feature vector structure is: [per_timestep_features_flattened, static_features]
-            # Per-timestep features: 29 features * 12 timesteps = 348 features
-            # Static features: 6 features
-            # Total: 354 features
-            
-            # We need to get the preprocessor's feature structure to find current_close index
-            print("Warning: current_prices not provided and scaler index mapping not implemented yet")
-            print("Using dummy current prices (this will cause incorrect loss calculation)")
-            current_prices = torch.ones(point_pred.shape[0], device=point_pred.device) * 50000.0  # Dummy BTC price
-        else:
-            print("Warning: Neither current_prices nor scaler provided for relative return conversion")
-            print("Using dummy current prices (this will cause incorrect loss calculation)")
-            current_prices = torch.ones(point_pred.shape[0], device=point_pred.device) * 50000.0  # Dummy BTC price
+        current_prices = extracted_current_prices
     
     # Convert relative returns to USD prices
     # USD_price = current_price * (1 + relative_return)
@@ -172,57 +164,25 @@ def precog_loss(point_pred: torch.Tensor,
     return total_loss
 
 
-def extract_current_prices_from_features(X: torch.Tensor, 
-                                       scaler: Optional[Any] = None,
-                                       preprocessor: Optional[Any] = None) -> torch.Tensor:
+def extract_current_prices_from_targets(targets: torch.Tensor) -> torch.Tensor:
     """
-    Extract current prices from the input feature tensor.
+    Extract current prices from the target tensor (37th feature).
     
     Args:
-        X: Input feature tensor [batch_size, flattened_features]
-        scaler: Fitted scaler for inverse transform
-        preprocessor: Preprocessor object with feature structure info
+        targets: Target tensor [batch_size, 37] with current_close as the 37th feature
         
     Returns:
         Current prices tensor [batch_size]
     """
-    if scaler is None or preprocessor is None:
-        print("Warning: Cannot extract current prices without scaler and preprocessor")
-        return torch.ones(X.shape[0], device=X.device) * 50000.0  # Dummy BTC price
-    
-    # Get preprocessor stats to understand feature structure
-    if hasattr(preprocessor, 'preprocessing_stats'):
-        stats = preprocessor.preprocessing_stats
-        n_per_timestep = stats.get('n_per_timestep_features', 29)
-        lookback = stats.get('lookback', 12)
-        static_features = stats.get('static_features', [])
-        
-        # Current close should be the first static feature
-        if 'current_close' in static_features:
-            current_close_idx = static_features.index('current_close')
-            # Calculate the position in the flattened feature vector
-            static_start_idx = n_per_timestep * lookback
-            current_close_feature_idx = static_start_idx + current_close_idx
-            
-            # Extract the scaled current close values
-            current_close_scaled = X[:, current_close_feature_idx]
-            
-            # Inverse transform to get actual USD prices
-            # We need to create a dummy array with the right shape for the scaler
-            dummy_features = torch.zeros((X.shape[0], X.shape[1]), device=X.device)
-            dummy_features[:, current_close_feature_idx] = current_close_scaled
-            
-            # Convert to numpy for sklearn scaler
-            dummy_features_np = dummy_features.detach().cpu().numpy()
-            dummy_features_unscaled = scaler.inverse_transform(dummy_features_np)
-            
-            # Extract the current close values
-            current_prices = torch.FloatTensor(dummy_features_unscaled[:, current_close_feature_idx]).to(X.device)
-            
-            return current_prices.clamp(min=EPSILON)
-    
-    print("Warning: Could not determine feature structure for current price extraction")
-    return torch.ones(X.shape[0], device=X.device) * 50000.0  # Dummy BTC price
+    if targets.shape[1] >= 37:
+        # Current close is the 37th target feature (index 36)
+        current_prices = targets[:, 36]  # Extract current_close from targets
+        return current_prices.clamp(min=EPSILON)
+    else:
+        print("Warning: Targets don't have 37th feature (current_close)")
+        print("Using dummy current prices (this will cause incorrect loss calculation)")
+        raise ValueError("Stop Here due to don't have current close target")
+        return torch.ones(targets.shape[0], device=targets.device) * 50000.0  # Dummy BTC price
 
 
 def evaluate_precog(model, data_loader, device, scaler=None) -> Dict[str, float]:
@@ -276,8 +236,8 @@ def evaluate_precog(model, data_loader, device, scaler=None) -> Dict[str, float]
                 print(f"Warning: NaN detected in evaluation model predictions")
                 continue
             
-            # Extract current prices from features (for relative return conversion)
-            current_prices = extract_current_prices_from_features(batch_X, scaler, getattr(data_loader.dataset, 'preprocessor', None))
+            # Extract current prices from targets (37th feature)
+            current_prices = extract_current_prices_from_targets(batch_y)
             
             # Precog loss calculation
             loss = precog_loss(point_pred, interval_pred, batch_y, scaler, current_prices)
@@ -310,7 +270,9 @@ def evaluate_precog(model, data_loader, device, scaler=None) -> Dict[str, float]
     all_current_prices = torch.cat(all_current_prices, dim=0)
     
     # Extract relative return targets and convert to USD prices
-    targets_reshaped = all_targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [point_return, min_return, max_return]
+    # Use only the first 36 features (relative returns), excluding the 37th feature (current_close)
+    relative_return_targets = all_targets[:, :36]
+    targets_reshaped = relative_return_targets.view(-1, 12, 3)  # [batch_size, 12, 3] for [point_return, min_return, max_return]
     
     # Extract relative return targets:
     point_return_target = targets_reshaped[:, 11, 0]  # point return at time step 11

@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 import json
 from tqdm import tqdm
 import warnings
@@ -401,13 +401,8 @@ class ModularTrainer:
             else:
                 raise ValueError("Predictions format not recognized for precog mode.")
             
-            # Extract current prices from input features for relative return conversion
-            current_prices = None
-            if batch_X is not None:
-                from losses.precog_loss import extract_current_prices_from_features
-                current_prices = extract_current_prices_from_features(batch_X, self.dataset.scaler, self.dataset.preprocessor)
-            
-            return precog_loss(point_pred, interval_pred, targets, self.dataset.scaler, current_prices)
+            # Extract current prices from targets (37th feature) - no need for batch_X anymore
+            return precog_loss(point_pred, interval_pred, targets, self.dataset.scaler, current_prices=None)
         elif self.config['mode'] == 'synth':
             detailed_pred = predictions[0] if isinstance(predictions, tuple) else predictions
             return synth_loss(detailed_pred, targets, self.dataset.scaler)
@@ -588,6 +583,218 @@ class ModularTrainer:
         
         return results
     
+    def walk_forward_cv(self, n_splits: int = 5, min_train_size: int = 1000, 
+                       step_size: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Perform walk-forward cross-validation for time series data.
+        
+        Args:
+            n_splits: Number of splits for cross-validation
+            min_train_size: Minimum size of training set
+            step_size: Step size for walk-forward (defaults to test_size)
+            
+        Returns:
+            Dictionary with cross-validation results
+        """
+        print(f"\nStarting walk-forward cross-validation with {n_splits} splits...")
+        
+        # Ensure data is loaded
+        if self.dataset is None:
+            self.setup_data()
+        
+        # Get the full dataset
+        if self.dataset is None:
+            raise RuntimeError("Dataset not properly initialized")
+        
+        if self.dataset.train_data is None or self.dataset.val_data is None or self.dataset.test_data is None:
+            raise RuntimeError("Dataset components not properly initialized")
+        
+        X_full, y_full = self.dataset.train_data
+        X_val, y_val = self.dataset.val_data
+        X_test, y_test = self.dataset.test_data
+        
+        # Combine training and validation data for CV
+        X_combined = np.concatenate([X_full, X_val], axis=0)
+        y_combined = np.concatenate([y_full, y_val], axis=0)
+        
+        total_samples = len(X_combined)
+        
+        # Calculate split parameters
+        if step_size is None:
+            step_size = (total_samples - min_train_size) // n_splits
+        
+        cv_results = []
+        fold_metrics = []
+        
+        print(f"Total samples: {total_samples}")
+        print(f"Min train size: {min_train_size}")
+        print(f"Step size: {step_size}")
+        
+        for fold in range(n_splits):
+            print(f"\n=== Fold {fold + 1}/{n_splits} ===")
+            
+            # Define train/validation split for this fold
+            train_end = min_train_size + fold * step_size
+            val_start = train_end
+            val_end = min(val_start + step_size, total_samples)
+            
+            if val_end <= val_start:
+                print(f"Skipping fold {fold + 1}: insufficient data")
+                continue
+            
+            # Split data for this fold
+            X_train_fold = X_combined[:train_end]
+            y_train_fold = y_combined[:train_end]
+            X_val_fold = X_combined[val_start:val_end]
+            y_val_fold = y_combined[val_start:val_end]
+            
+            print(f"Train: {len(X_train_fold)} samples")
+            print(f"Val: {len(X_val_fold)} samples")
+            
+            # Create data loaders for this fold
+            train_dataset = MemoryEfficientDataset(X_train_fold, y_train_fold)
+            val_dataset = MemoryEfficientDataset(X_val_fold, y_val_fold)
+            
+            batch_size = min(512, 256)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, 
+                                    num_workers=min(4, 2), pin_memory=True)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                  num_workers=min(4, 2), pin_memory=True)
+            
+            # Reset model for this fold
+            self.setup_model()
+            self.setup_training()
+            
+            # Override data loaders for this fold
+            self.train_loader = train_loader
+            self.val_loader = val_loader
+            
+            # Train model for this fold
+            fold_best_score = float('inf')
+            fold_history = {'train_losses': [], 'val_scores': []}
+            
+            # Training loop for this fold
+            early_stopping = EarlyStopping(patience=self.config['patience'])
+            
+            for epoch in range(self.config['epochs']):
+                self.current_epoch = epoch
+                
+                # Train epoch
+                train_loss = self.train_epoch()
+                
+                # Validate epoch
+                val_loss = self.validate_epoch()
+                
+                # Update history
+                fold_history['train_losses'].append(train_loss)
+                fold_history['val_scores'].append(val_loss)
+                
+                # Track best score for this fold
+                if val_loss < fold_best_score:
+                    fold_best_score = val_loss
+                
+                # Print progress
+                if epoch % 5 == 0 or epoch == self.config['epochs'] - 1:
+                    print(f"  Epoch {epoch+1}/{self.config['epochs']}: "
+                          f"Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+                
+                # Early stopping
+                early_stopping(val_loss)
+                if early_stopping.early_stop:
+                    print(f"  Early stopping at epoch {epoch+1}")
+                    break
+            
+            # Store fold results
+            fold_result = {
+                'fold': fold + 1,
+                'train_size': len(X_train_fold),
+                'val_size': len(X_val_fold),
+                'train_end': train_end,
+                'val_start': val_start,
+                'val_end': val_end,
+                'best_val_loss': fold_best_score,
+                'final_train_loss': fold_history['train_losses'][-1],
+                'epochs_trained': len(fold_history['train_losses']),
+                'history': fold_history
+            }
+            
+            cv_results.append(fold_result)
+            fold_metrics.append(fold_best_score)
+            
+            print(f"  Fold {fold + 1} completed: Best Val Loss = {fold_best_score:.4f}")
+        
+        # Calculate cross-validation metrics
+        cv_mean = np.mean(fold_metrics)
+        cv_std = np.std(fold_metrics)
+        
+        cv_summary = {
+            'n_splits': len(cv_results),
+            'cv_mean_loss': cv_mean,
+            'cv_std_loss': cv_std,
+            'cv_scores': fold_metrics,
+            'fold_results': cv_results
+        }
+        
+        print(f"\n=== Walk-Forward CV Results ===")
+        print(f"CV Mean Loss: {cv_mean:.4f} ± {cv_std:.4f}")
+        print(f"Individual fold scores: {[f'{score:.4f}' for score in fold_metrics]}")
+        
+        return cv_summary
+    
+    def run_walk_forward_cv_pipeline(self, n_splits: int = 5, min_train_size: int = 1000, 
+                                   step_size: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Run the complete walk-forward cross-validation pipeline.
+        
+        Args:
+            n_splits: Number of splits for cross-validation
+            min_train_size: Minimum size of training set
+            step_size: Step size for walk-forward (defaults to test_size)
+            
+        Returns:
+            Dictionary with cross-validation results
+        """
+        try:
+            print("Starting walk-forward cross-validation pipeline...")
+            
+            # Setup data
+            self.setup_data()
+            
+            # Run cross-validation
+            cv_results = self.walk_forward_cv(n_splits, min_train_size, step_size)
+            
+            # After CV, train final model on full training data
+            print("\nTraining final model on full training data...")
+            self.setup_model()
+            self.setup_training()
+            self.train()
+            
+            # Evaluate final model on test set
+            print("\nEvaluating final model on test set...")
+            test_results = self.evaluate()
+            
+            # Combine results
+            final_results = {
+                'cross_validation': cv_results,
+                'final_test_results': test_results
+            }
+            
+            # Save results
+            results_path = Path(self.config['save_dir']) / 'walk_forward_cv_results.json'
+            with open(results_path, 'w') as f:
+                json.dump(final_results, f, indent=2)
+            
+            print(f"Walk-forward CV pipeline completed successfully!")
+            print(f"Results saved to: {results_path}")
+            
+            return final_results
+            
+        except Exception as e:
+            print(f"Walk-forward CV pipeline failed with error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+    
     def run_full_pipeline(self):
         """Run the complete training pipeline."""
         try:
@@ -627,9 +834,15 @@ def main():
     parser = argparse.ArgumentParser(description='Modular Bitcoin Price Prediction Training')
     parser.add_argument('--config', type=str, required=True,
                         help='Path to configuration file')
-    parser.add_argument('--mode', type=str, choices=['train', 'evaluate', 'test'],
-                        default='train', help='Mode to run')
+    parser.add_argument('--mode', type=str, choices=['train', 'evaluate', 'test', 'walk_forward_cv'],
+                        default='walk_forward_cv', help='Mode to run')
     parser.add_argument('--model_path', type=str, help='Path to model for evaluation')
+    parser.add_argument('--n_splits', type=int, default=5,
+                        help='Number of splits for walk-forward cross-validation')
+    parser.add_argument('--min_train_size', type=int, default=150000,
+                        help='Minimum training size for walk-forward CV')
+    parser.add_argument('--step_size', type=int, default=None,
+                        help='Step size for walk-forward CV (defaults to auto-calculated)')
     
     args = parser.parse_args()
     
@@ -668,6 +881,17 @@ def main():
         # Evaluate
         results = trainer.evaluate()
         print(f"Evaluation completed: {results}")
+    
+    elif args.mode == 'walk_forward_cv':
+        # Run walk-forward cross-validation
+        print("Running walk-forward cross-validation...")
+        cv_results = trainer.run_walk_forward_cv_pipeline(
+            n_splits=args.n_splits,
+            min_train_size=args.min_train_size,
+            step_size=args.step_size
+        )
+        if not cv_results:
+            sys.exit(1)
     
     elif args.mode == 'test':
         # Test configuration loading

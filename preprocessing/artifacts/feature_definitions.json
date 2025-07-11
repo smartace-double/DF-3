@@ -31,7 +31,6 @@
     "sopr"
   ],
   "static_features": [
-    "current_close",
     "log_current_close",
     "hour_sin",
     "hour_cos",
@@ -74,6 +73,7 @@
     "target_max_return_10",
     "target_point_return_11",
     "target_min_return_11",
-    "target_max_return_11"
+    "target_max_return_11",
+    "target_current_close"
   ]
 }
